@@ -296,7 +296,14 @@ impl<G: Geometry> Builder<G> {
 /// geometry-changing commands emit diagnostics. Malformed motion words and
 /// impossible arcs return a line-numbered error rather than invented geometry.
 pub fn parse_gcode(text: &str) -> Result<ToolpathData, ParseError> {
-    let p = interpret::<LayerTable>(text)?;
+    parse_detailed(text, None)
+}
+
+pub(crate) fn parse_detailed(
+    text: &str,
+    info: Option<&mut crate::print_info::Collector>,
+) -> Result<ToolpathData, ParseError> {
+    let p = interpret::<LayerTable>(text, info)?;
     Ok(ToolpathData {
         layers: p.geometry,
         bounds: p.bounds,
@@ -307,11 +314,17 @@ pub fn parse_gcode(text: &str) -> Result<ToolpathData, ParseError> {
     })
 }
 
-pub(crate) fn parse_features(text: &str) -> Result<Print<FeaturePaths>, ParseError> {
-    interpret(text)
+pub(crate) fn parse_features(
+    text: &str,
+    info: Option<&mut crate::print_info::Collector>,
+) -> Result<Print<FeaturePaths>, ParseError> {
+    interpret(text, info)
 }
 
-fn interpret<G: Geometry>(text: &str) -> Result<Print<G>, ParseError> {
+fn interpret<G: Geometry>(
+    text: &str,
+    mut info: Option<&mut crate::print_info::Collector>,
+) -> Result<Print<G>, ParseError> {
     if text.as_bytes().contains(&0) {
         return Err(error(
             0,
@@ -339,6 +352,11 @@ fn interpret<G: Geometry>(text: &str) -> Result<Print<G>, ParseError> {
         let line = index + 1;
         if raw.len() > MAX_LINE_BYTES {
             return Err(error(line, "line exceeds 1 MiB limit"));
+        }
+        if let Some(info) = &mut info
+            && end >= info.body_offset
+        {
+            info.line(raw);
         }
         if let Some(motion) = words.plain_motion(raw.as_bytes()) {
             state.motion = Some(motion);
@@ -369,8 +387,7 @@ fn interpret<G: Geometry>(text: &str) -> Result<Print<G>, ParseError> {
             builder.group_has_lines = true;
             continue;
         }
-        // Commands carrying display strings/version strings are not numeric
-        // G-code blocks. Their text can contain what looks like XYZ words.
+        // These firmware commands accept text or bare flags instead of motion words.
         let first = first_command(code);
         if matches!(
             first.and_then(|s| s.strip_prefix(['M', 'm'])),
@@ -383,11 +400,13 @@ fn interpret<G: Geometry>(text: &str) -> Result<Print<G>, ParseError> {
                     | "30"
                     | "32"
                     | "486"
+                    | "620" // Bambu AMS flags include a bare M (enable remapping).
                     | "862.1"
                     | "862.3"
                     | "862.4"
                     | "862.5"
                     | "862.6"
+                    | "1002" // Bambu action names and filament labels are free text.
             )
         ) {
             builder.group_has_lines = true;

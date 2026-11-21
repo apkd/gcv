@@ -16,6 +16,7 @@ mod geometry;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod parser;
+mod print_info;
 pub mod renderer;
 pub mod types;
 
@@ -60,12 +61,13 @@ impl Error for LoadError {
 
 /// Detects binary G-code by its magic, independent of filename extension.
 pub fn load_toolpath(path: impl AsRef<Path>) -> Result<ToolpathData, LoadError> {
-    load_with(path, parser::parse_gcode)
+    load_with(path, None, parser::parse_detailed)
 }
 
 pub(crate) fn load_with<T>(
     path: impl AsRef<Path>,
-    parse: impl FnOnce(&str) -> Result<T, parser::ParseError>,
+    info: Option<&mut print_info::Collector>,
+    parse: impl FnOnce(&str, Option<&mut print_info::Collector>) -> Result<T, parser::ParseError>,
 ) -> Result<T, LoadError> {
     let file = File::open(path).map_err(LoadError::Io)?;
     let size = file.metadata().map_err(LoadError::Io)?.len();
@@ -76,27 +78,29 @@ pub(crate) fn load_with<T>(
     file.take(MAX_INPUT_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(LoadError::Io)?;
-    decode_with(&bytes, parse)
+    decode_with(&bytes, info, parse)
 }
 
 /// Decode an in-memory text or binary G-code file.
 pub fn parse_bytes(bytes: &[u8]) -> Result<ToolpathData, LoadError> {
-    decode_with(bytes, parser::parse_gcode)
+    decode_with(bytes, None, parser::parse_detailed)
 }
 fn decode_with<T>(
     bytes: &[u8],
-    parse: impl FnOnce(&str) -> Result<T, parser::ParseError>,
+    mut info: Option<&mut print_info::Collector>,
+    parse: impl FnOnce(&str, Option<&mut print_info::Collector>) -> Result<T, parser::ParseError>,
 ) -> Result<T, LoadError> {
     if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(LoadError::TooLarge);
     }
     if bytes.starts_with(b"GCDE") {
-        let text = bgcode::decode_bgcode(bytes).map_err(LoadError::Binary)?;
-        parse(&text).map_err(LoadError::Parse)
+        let text = bgcode::decode(bytes, Default::default(), info.as_deref_mut())
+            .map_err(LoadError::Binary)?;
+        parse(&text, info).map_err(LoadError::Parse)
     } else {
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
         let text = std::str::from_utf8(bytes).map_err(LoadError::Utf8)?;
-        parse(text).map_err(LoadError::Parse)
+        parse(text, info).map_err(LoadError::Parse)
     }
 }
 

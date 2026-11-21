@@ -49,6 +49,9 @@ gcv model.gcode
 # Basic export
 gcv model.gcode --export output.png
 
+# File preview with the slicer's print time, filament and settings
+gcv model.gcode --print-info -r 1280x900 -e preview.png
+
 # Custom options
 gcv model.gcode -e output.png \
   --camera front \
@@ -79,6 +82,7 @@ gcv model.gcode -e output.png \
 | `--min-layer` | 0 | Minimum layer to display |
 | `--scale`, `-s` | 1 | Scale viewport and PNG resolution (e.g. `0.5` for half width and height) |
 | `--no-legend` | off | Hide the legend |
+| `--print-info` | off | Add available slicer estimates, filament, temperatures, and layer settings to the PNG. Combine with `--no-legend` for the summary alone. |
 | `--orthographic` | off | Use an orthographic camera |
 | `--stats` | off | Print toolpath statistics as JSON |
 | `--strict` | off | Reject unsupported or approximate commands |

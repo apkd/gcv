@@ -9,6 +9,7 @@ use crate::types::Bounds;
 pub(crate) fn render_features(
     print: &Print<FeaturePaths>,
     options: &RenderOptions,
+    info: Option<&crate::print_info::PrintInfo>,
 ) -> Result<Frame, RenderError> {
     options.validate()?;
     let geom = &print.geometry;
@@ -21,7 +22,7 @@ pub(crate) fn render_features(
             s.arc.map(|i| geom.arcs[i.get() as usize - 1]),
         );
     }
-    let legend = Legend::new(options, || colors::feature_legend(&geom.counts));
+    let legend = Legend::new(options, info, || colors::feature_legend(&geom.counts));
     let (mut raster, p) = canvas(print.bed, options, &subject, legend.as_ref())?;
     let mut tolerance = [arc_tolerance(&p, print.bounds); 2];
     if let Some(bounds) = subject.bounds() {
@@ -201,7 +202,7 @@ mod tests {
 
     fn draw(text: &str, options: &RenderOptions, compact: bool) -> Frame {
         if compact {
-            render_features(&parse_features(text).unwrap(), options).unwrap()
+            render_features(&parse_features(text, None).unwrap(), options, None).unwrap()
         } else {
             super::super::render(&parse_gcode(text).unwrap(), options).unwrap()
         }
@@ -289,7 +290,7 @@ mod tests {
     fn simplified_arcs_keep_original_counts_and_legend() {
         let text = "M83\nG0 X10 Z.2\n;TYPE:Perimeter\nG2 X0 Y10 I-10 P2 E1\n;TYPE:Infill\nG3 X10.001 Y0 I0 J-10 E2\nG2 Z2 I1 P2\nG1 X6 E1";
         let detailed = parse_gcode(text).unwrap();
-        let compact = parse_features(text).unwrap();
+        let compact = parse_features(text, None).unwrap();
         assert_eq!(compact.layers, detailed.total_layers());
         assert_eq!(compact.segments, detailed.total_segments());
         assert_eq!(compact.diagnostics, detailed.diagnostics);
@@ -314,7 +315,7 @@ mod tests {
                 }
             }
         }
-        let print = parse_features(&paths).unwrap();
+        let print = parse_features(&paths, None).unwrap();
         let options = RenderOptions {
             width: 320,
             height: 240,

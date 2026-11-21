@@ -250,7 +250,7 @@ mod tests {
                 show_bed: false,
                 ..Default::default()
             };
-            let legend = Legend::new(&options, || colors::feature_legend(&[1; 14])).unwrap();
+            let legend = Legend::new(&options, None, || colors::feature_legend(&[1; 14])).unwrap();
             let mut subject = Subject::default();
             // Untagged models and a file containing only auxiliary extrusion
             // must both frame all deposited material, including separate parts.

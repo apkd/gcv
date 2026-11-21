@@ -314,9 +314,9 @@ fn unsupported_geometry_is_visible_and_warnings_are_deduplicated() {
 }
 
 #[test]
-fn display_and_version_strings_are_not_motion_words() {
+fn firmware_arguments_are_not_motion_words() {
     let data =
-        parse_gcode("M117 Printing X0.2.3 NaN\nM115 U6.4.0+11974\nM862.3 P\"MK4S\"\nG1 X10 E1")
+        parse_gcode("M117 Printing X0.2.3 NaN\nM115 U6.4.0+11974\nM862.3 P\"MK4S\"\nM1002 gcode_claim_action : 2\nM620 M\nG1 X10 E1")
             .unwrap();
     assert_eq!(data.total_segments(), 1);
     assert_eq!(data.segments().next().unwrap().end, [10.0, 0.0, 0.0]);

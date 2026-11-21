@@ -5,6 +5,7 @@
 use std::{error::Error, fmt};
 mod features;
 mod framing;
+mod summary;
 #[cfg(feature = "gui")]
 pub(crate) mod viewport;
 pub(crate) use features::render_features;
@@ -529,10 +530,7 @@ impl Raster {
     }
 
     fn text(&mut self, x: i32, y: i32, text: &str, color: [u8; 3], scale: i32) {
-        let text = text
-            .replace('°', "o")
-            .replace('³', "3")
-            .to_ascii_uppercase();
+        let text = text.replace('³', "3").to_ascii_uppercase();
         for (index, character) in text.chars().enumerate() {
             let origin_x = x + index as i32 * 6 * scale;
             if origin_x >= self.frame.width as i32 {
@@ -682,6 +680,7 @@ fn bed_lines(
 
 struct Legend {
     entries: Vec<colors::LegendEntry>,
+    summary: Vec<summary::Row>,
     title: String,
     pad: i32,
     scale: i32,
@@ -692,35 +691,60 @@ struct Legend {
 impl Legend {
     fn new(
         options: &RenderOptions,
+        info: Option<&crate::print_info::PrintInfo>,
         entries: impl FnOnce() -> Vec<colors::LegendEntry>,
     ) -> Option<Self> {
-        if !options.show_legend || options.width < 240 || options.height < 100 {
+        if (!options.show_legend && info.is_none()) || options.width < 240 || options.height < 100 {
             return None;
         }
-        let mut entries = entries();
-        if entries.is_empty() {
-            return None;
-        }
+        let mut entries = if options.show_legend {
+            entries()
+        } else {
+            Vec::new()
+        };
         let scale = (options.width / 640).min(options.height / 450).clamp(1, 4) as i32;
         let pad = 10 * scale;
-        let title = options
-            .color_mode
-            .label()
-            .replace('°', "o")
-            .replace('³', "3");
+        let title = if entries.is_empty() {
+            "PRINT INFO".into()
+        } else {
+            options
+                .color_mode
+                .label()
+                .replace('°', "o")
+                .replace('³', "3")
+        };
+        let available_rows = ((options.height as i32 - 5 * pad) / (12 * scale)).max(0) as usize;
+        let row_count = entries.len().min(available_rows);
+        let columns = ((options.width as i32 * 3 / 5 - 2 * pad) / (6 * scale)).max(1) as usize;
+        let mut summary = info.map(|i| summary::rows(i, columns)).unwrap_or_default();
+        let gap = if row_count > 0 { 6 * scale } else { 0 };
+        let remaining = options.height as i32 - 5 * pad - row_count as i32 * 12 * scale - gap;
+        summary.retain(|row| {
+            row.text.chars().count() + 2 * usize::from(row.swatch.is_some()) <= columns
+        });
+        summary.truncate((remaining.max(0) / (12 * scale)) as usize);
+        if entries.is_empty() && summary.is_empty() {
+            return None;
+        }
         let max_length = entries
             .iter()
             .map(|entry| entry.label.chars().count() + 3)
+            .chain(
+                summary
+                    .iter()
+                    .map(|r| r.text.chars().count() + usize::from(r.swatch.is_some()) * 2),
+            )
             .chain([title.chars().count()])
             .max()
             .unwrap_or(0) as i32;
         let width = (max_length * 6 * scale + 2 * pad).min(options.width as i32 - 2 * pad);
-        let available_rows = ((options.height as i32 - 5 * pad) / (12 * scale)).max(0) as usize;
-        let row_count = entries.len().min(available_rows);
-        let height = 3 * pad + row_count as i32 * 12 * scale;
+        let height = 3 * pad
+            + (row_count + summary.len()) as i32 * 12 * scale
+            + if summary.is_empty() { 0 } else { gap };
         entries.truncate(row_count);
         Some(Self {
             entries,
+            summary,
             title,
             pad,
             scale,
@@ -732,6 +756,7 @@ impl Legend {
     fn draw(self, raster: &mut Raster) {
         let Self {
             entries,
+            summary,
             title,
             pad,
             scale,
@@ -741,12 +766,30 @@ impl Legend {
         raster.rectangle(pad, pad, width, height, [22, 25, 32], 0.95);
         raster.rectangle(pad, pad, 2 * scale, height, [92, 109, 132], 1.0);
         raster.text(pad * 2, pad * 2, &title, [235, 238, 245], scale);
+        let summary_y = pad * 4
+            + entries.len() as i32 * 12 * scale
+            + if entries.is_empty() { 0 } else { 6 * scale };
         for (index, entry) in entries.into_iter().enumerate() {
             let y = pad * 4 + index as i32 * 12 * scale;
             raster.rectangle(pad * 2, y, 7 * scale, 7 * scale, entry.color, 1.0);
             let max_characters = ((width - 2 * pad - 12 * scale) / (6 * scale)).max(0) as usize;
             let label: String = entry.label.chars().take(max_characters).collect();
-            raster.text(pad * 2 + 12 * scale, y, &label, [218, 223, 232], scale);
+            raster.text(
+                pad * 2 + 12 * scale,
+                y,
+                &label.replace('°', "o"),
+                [218, 223, 232],
+                scale,
+            );
+        }
+        for (index, row) in summary.into_iter().enumerate() {
+            let y = summary_y + index as i32 * 12 * scale;
+            let mut x = pad * 2;
+            if let Some(color) = row.swatch {
+                raster.rectangle(x, y, 7 * scale, 7 * scale, color, 1.);
+                x += 12 * scale;
+            }
+            raster.text(x, y, &row.text, [218, 223, 232], scale);
         }
     }
 }
@@ -768,10 +811,18 @@ fn canvas(
 }
 
 pub fn render(toolpath: &ToolpathData, options: &RenderOptions) -> Result<Frame, RenderError> {
+    render_with_info(toolpath, options, None)
+}
+
+pub(crate) fn render_with_info(
+    toolpath: &ToolpathData,
+    options: &RenderOptions,
+    info: Option<&crate::print_info::PrintInfo>,
+) -> Result<Frame, RenderError> {
     options.validate()?;
     let segments = toolpath.layers.range(options.layers(toolpath));
     let subject = Subject::from_segments(segments, options.show_travel);
-    let legend = Legend::new(options, || {
+    let legend = Legend::new(options, info, || {
         colors::legend_entries(toolpath, options.color_mode, options.show_travel)
     });
     let (mut raster, projection) = canvas(
@@ -873,6 +924,11 @@ fn glyph(character: char) -> [u8; 7] {
         '+' => [0, 4, 4, 31, 4, 4, 0],
         '/' => [1, 2, 2, 4, 8, 8, 16],
         '%' => [25, 25, 2, 4, 8, 19, 19],
+        '°' => [6, 9, 6, 0, 0, 0, 0],
+        '→' => [0, 4, 2, 31, 2, 4, 0],
+        '@' => [14, 17, 23, 21, 23, 16, 14],
+        '&' => [12, 18, 20, 8, 21, 18, 13],
+        '#' => [10, 10, 31, 10, 31, 10, 10],
         '(' => [2, 4, 8, 8, 8, 4, 2],
         ')' => [8, 4, 2, 2, 2, 4, 8],
         '_' => [0, 0, 0, 0, 0, 0, 31],

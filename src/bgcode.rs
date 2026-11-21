@@ -98,6 +98,14 @@ pub fn decode_bgcode_with_limits(
     bytes: &[u8],
     limits: DecodeLimits,
 ) -> Result<String, BgcodeError> {
+    decode(bytes, limits, None)
+}
+
+pub(crate) fn decode(
+    bytes: &[u8],
+    limits: DecodeLimits,
+    mut info: Option<&mut crate::print_info::Collector>,
+) -> Result<String, BgcodeError> {
     let mut reader = Reader { bytes, pos: 0 };
     if reader.take(4)? != b"GCDE" {
         return Err(BgcodeError::new(0, "expected GCDE magic number"));
@@ -225,15 +233,33 @@ pub fn decode_bgcode_with_limits(
                     0 => {
                         for line in text.lines() {
                             append_comment(&mut metadata, line, remaining, offset)?;
+                            if let Some(info) = &mut info
+                                && let Some((k, v)) = line.split_once('=')
+                            {
+                                info.binary_field(block_type, k.trim(), v.trim());
+                            }
                         }
                     }
                     1 => {
                         let value: serde_json::Value = serde_json::from_str(text).map_err(|e| {
                             BgcodeError::new(offset, format!("invalid JSON metadata: {e}"))
                         })?;
-                        append_json_metadata(&mut metadata, &value, remaining, offset)?;
+                        append_json_metadata(
+                            &mut metadata,
+                            &value,
+                            remaining,
+                            offset,
+                            &mut |key, json, text| {
+                                if let Some(info) = &mut info {
+                                    info.binary_json_field(block_type, key, json, text);
+                                }
+                            },
+                        )?;
                     }
                     _ => return Err(BgcodeError::new(offset, "unsupported metadata encoding")),
+                }
+                if let Some(info) = &mut info {
+                    info.body_offset = metadata.len();
                 }
             }
         }
@@ -289,13 +315,14 @@ fn append_json_metadata(
     value: &serde_json::Value,
     limit: usize,
     offset: usize,
+    field: &mut impl FnMut(&str, &serde_json::Value, &str),
 ) -> Result<(), BgcodeError> {
     if let Some(object) = value.as_object() {
         for (key, value) in object {
             if value.is_object() {
-                append_json_metadata(out, value, limit, offset)?;
+                append_json_metadata(out, value, limit, offset, field)?;
             } else {
-                let value = match value {
+                let text = match value {
                     serde_json::Value::String(s) => s.clone(),
                     // Preserve familiar INI-style arrays: [250,210] -> 250,210.
                     serde_json::Value::Array(values) => values
@@ -309,7 +336,8 @@ fn append_json_metadata(
                         .join(","),
                     value => value.to_string(),
                 };
-                append_comment(out, &format!("{key} = {value}"), limit, offset)?;
+                field(key, value, &text);
+                append_comment(out, &format!("{key} = {text}"), limit, offset)?;
             }
         }
     } else {
