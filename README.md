@@ -1,8 +1,8 @@
-# gcode-viewer
+# gcv
 
-3D G-code toolpath viewer with interactive GUI and CLI PNG export. Supports `.gcode` and `.bgcode` files via [gcode-lib](https://github.com/hyiger/gcode-lib).
+3D G-code toolpath viewer with interactive GUI and CLI PNG export. Supports `.gcode` and `.bgcode` files.
 
-![3DBenchy toolpath visualization](docs/benchy_preview.png)
+[![3DBenchy toolpaths in all six color modes](docs/benchy_preview.gif)](https://github.com/hyiger/gcode-lib/blob/48343a78659424cf2b14e7299ca90568306c4ede/tests/3DBenchy_0.6n_0.32mm_FLEX_COREONE_32m.gcode)
 
 ## Features
 
@@ -15,23 +15,20 @@
 
 ## Installation
 
-Requires Python >= 3.10 and [uv](https://docs.astral.sh/uv/).
+Download a Linux binary from the [rolling release](https://github.com/apkd/gcv/releases/tag/release), or install from source:
 
 ```bash
-uv sync
+cargo install --path . --locked
 ```
 
-> **Note:** [gcode-lib](https://github.com/hyiger/gcode-lib) >= 1.1.0 is required. Install it editable if developing locally:
-> ```bash
-> uv pip install -e /path/to/gcode-lib
-> ```
+With Nix, run `nix profile add .` from the checkout.
 
 ## Usage
 
 ### Interactive GUI
 
 ```bash
-gcode-viewer model.gcode
+gcv model.gcode
 ```
 
 **Keyboard shortcuts:**
@@ -50,10 +47,10 @@ gcode-viewer model.gcode
 
 ```bash
 # Basic export
-gcode-viewer model.gcode --export output.png
+gcv model.gcode --export output.png
 
 # Custom options
-gcode-viewer model.gcode -e output.png \
+gcv model.gcode -e output.png \
   --camera front \
   --layer 50 \
   --resolution 2560x1440 \
@@ -62,7 +59,7 @@ gcode-viewer model.gcode -e output.png \
   --no-bed
 
 # Custom camera angle
-gcode-viewer model.gcode -e output.png \
+gcv model.gcode -e output.png \
   --camera-azimuth 45 --camera-elevation 30
 ```
 
@@ -79,6 +76,12 @@ gcode-viewer model.gcode -e output.png \
 | `--show-travel` | off | Show travel moves |
 | `--no-bed` | off | Hide print bed |
 | `--color-mode` | `feature` | `feature`, `height`, `speed`, `fan`, `temperature`, `flow` |
+| `--min-layer` | 0 | Minimum layer to display |
+| `--scale`, `-s` | 1 | Multiply export dimensions |
+| `--no-legend` | off | Hide the legend |
+| `--orthographic` | off | Use an orthographic camera |
+| `--stats` | off | Print toolpath statistics as JSON |
+| `--strict` | off | Reject unsupported or approximate commands |
 
 ## Architecture
 
@@ -86,55 +89,33 @@ gcode-viewer model.gcode -e output.png \
 G-code file
     |
     v
-extractor.py  -- gcode-lib parsing --> ToolpathData (layers of Segments)
+parser.rs / bgcode.rs  --> parsed toolpaths
     |
     v
-renderer.py   -- PyVista scene     --> per-layer actors (visibility toggle)
+    +--> GPU viewport  --> interactive viewer
     |
-    v
-gui.py / cli.py                    --> interactive viewer or PNG export
+    +--> CPU renderer  --> PNG export
 ```
-
-**Key design:** one PyVista actor per layer enables fast layer slider updates via visibility toggling — no geometry rebuild needed. Color mode changes recolor cell data in-place.
 
 ## Testing
 
 ```bash
-# Unit tests (fast, ~2s)
-uv run pytest -m "not integration"
-
-# With coverage
-uv run pytest -m "not integration" --cov=gcode_viewer --cov-report=term-missing
-
-# Integration tests (requires benchy gcode file, ~12min)
-uv run pytest -m integration
-
-# Full suite
-uv run pytest --cov=gcode_viewer
+cargo test --locked --all-features
+cargo test --locked --no-default-features
 ```
 
 ## Project Structure
 
 ```
-src/gcode_viewer/
-  __init__.py       # version
-  __main__.py       # python -m entry point
-  types.py          # ExtrusionType, ColorMode, Segment, LayerData, ToolpathData
-  extractor.py      # G-code parsing via gcode-lib
-  colors.py         # color palettes, gradients, legend labels
-  camera.py         # camera preset calculations
-  bed.py            # bed plane, grid, border geometry
-  renderer.py       # PyVista scene assembly & recoloring
-  gui.py            # interactive viewer (PyVista + Qt)
-  cli.py            # argparse + export entry point
-tests/
-  conftest.py       # shared fixtures
-  test_*.py         # unit & integration tests
+src/
+  types.rs          # segments, layers, toolpath data
+  parser.rs         # G-code parsing
+  bgcode.rs         # binary G-code decoding
+  geometry.rs       # strokes and arcs
+  colors.rs         # color palettes, gradients, legend labels
+  camera.rs         # camera preset calculations
+  renderer.rs       # toolpath and bed rendering
+  gui.rs            # interactive viewer
+  cli.rs            # command-line options and PNG export
+tests/              # unit and integration tests
 ```
-
-## Dependencies
-
-- [gcode-lib](https://github.com/hyiger/gcode-lib) — G-code parsing, arc linearization, volume detection
-- [PyVista](https://pyvista.org/) — 3D mesh visualization and off-screen rendering
-- [NumPy](https://numpy.org/) — array operations
-- [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) — GUI framework
