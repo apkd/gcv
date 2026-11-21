@@ -13,18 +13,16 @@ pub(crate) fn render_features(
     options.validate()?;
     let geom = &print.geometry;
     let mut subject = Subject::default();
-    if !options.show_bed {
-        for s in &geom.strokes {
-            subject.include(
-                Role::of(s.feature),
-                s.start,
-                s.end,
-                s.arc.map(|i| geom.arcs[i.get() as usize - 1]),
-            );
-        }
+    for s in &geom.strokes {
+        subject.include(
+            Role::of(s.feature),
+            s.start,
+            s.end,
+            s.arc.map(|i| geom.arcs[i.get() as usize - 1]),
+        );
     }
     let legend = Legend::new(options, || colors::feature_legend(&geom.counts));
-    let (mut raster, p) = canvas(print.bounds, print.bed, options, &subject, legend.as_ref())?;
+    let (mut raster, p) = canvas(print.bed, options, &subject, legend.as_ref())?;
     let mut tolerance = [arc_tolerance(&p, print.bounds); 2];
     if let Some(bounds) = subject.bounds() {
         tolerance[subject.role as usize] = arc_tolerance(&p, bounds);
@@ -201,6 +199,61 @@ mod tests {
     use super::*;
     use crate::parser::{parse_features, parse_gcode};
 
+    fn draw(text: &str, options: &RenderOptions, compact: bool) -> Frame {
+        if compact {
+            render_features(&parse_features(text).unwrap(), options).unwrap()
+        } else {
+            super::super::render(&parse_gcode(text).unwrap(), options).unwrap()
+        }
+    }
+
+    fn foreground_bounds(frame: &Frame) -> ([u32; 2], [u32; 2]) {
+        let mut min = [frame.width, frame.height];
+        let mut max = [0, 0];
+        for (i, px) in frame.rgba.as_chunks::<4>().0.iter().enumerate() {
+            if px[..3] != colors::BACKGROUND {
+                let point = [i as u32 % frame.width, i as u32 / frame.width];
+                for k in 0..2 {
+                    min[k] = min[k].min(point[k]);
+                    max[k] = max[k].max(point[k]);
+                }
+            }
+        }
+        (min, max)
+    }
+
+    #[test]
+    fn bed_view_fits_the_plate_and_print_without_hidden_parking_moves() {
+        let options = RenderOptions {
+            width: 480,
+            height: 390,
+            show_legend: false,
+            ..Default::default()
+        };
+        for compact in [false, true] {
+            for height in [30, 420] {
+                let print =
+                    format!("M83\n;TYPE:Perimeter\nG0 X125 Y100 Z1\nG1 X130 E1\nG1 Z{height} E1\n");
+                let frame = draw(&print, &options, compact);
+                assert!(
+                    frame == draw(&(print + "G0 Y290 Z800\n"), &options, compact),
+                    "parking changed the fit"
+                );
+                let (min, max) = foreground_bounds(&frame);
+                assert!(
+                    min[0] > 0
+                        && min[1] > 0
+                        && max[0] < frame.width - 1
+                        && max[1] < frame.height - 1
+                );
+                assert!(
+                    max[0] - min[0] > frame.width * 9 / 10
+                        || max[1] - min[1] > frame.height * 9 / 10
+                );
+            }
+        }
+    }
+
     #[test]
     fn bedless_fit_preserves_the_full_circle_despite_purge_and_park_moves() {
         use crate::camera::{Camera, CameraPreset};
@@ -215,27 +268,14 @@ mod tests {
             ..Default::default()
         };
         for compact in [false, true] {
-            let draw = |text: &str| {
-                if compact {
-                    render_features(&parse_features(text).unwrap(), &options).unwrap()
-                } else {
-                    super::super::render(&parse_gcode(text).unwrap(), &options).unwrap()
-                }
-            };
-            let clean = draw(&format!("M83\n{object}"));
-            let with_setup = draw(&format!("M83\n{purge}{object}G0 X900 Y300 Z900\n"));
+            let clean = draw(&format!("M83\n{object}"), &options, compact);
+            let with_setup = draw(
+                &format!("M83\n{purge}{object}G0 X900 Y300 Z900\n"),
+                &options,
+                compact,
+            );
             assert_eq!(clean, with_setup);
-            let mut min = [clean.width, clean.height];
-            let mut max = [0, 0];
-            for (i, px) in clean.rgba.as_chunks::<4>().0.iter().enumerate() {
-                if px[..3] != colors::BACKGROUND {
-                    let point = [i as u32 % clean.width, i as u32 / clean.width];
-                    for k in 0..2 {
-                        min[k] = min[k].min(point[k]);
-                        max[k] = max[k].max(point[k]);
-                    }
-                }
-            }
+            let (min, max) = foreground_bounds(&clean);
             // A complete centered circle fills most of the shorter dimension.
             for (k, dim) in [clean.width, clean.height].into_iter().enumerate() {
                 assert!(max[k] - min[k] > clean.height * 3 / 4);
@@ -282,8 +322,7 @@ mod tests {
             ..Default::default()
         };
         let draw = |threads| {
-            let (mut raster, p) =
-                canvas(print.bounds, print.bed, &options, &Subject::default(), None).unwrap();
+            let (mut raster, p) = canvas(print.bed, &options, &Subject::default(), None).unwrap();
             if threads == 0 {
                 project_strokes(
                     &p,

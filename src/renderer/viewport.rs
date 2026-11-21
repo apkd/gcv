@@ -308,17 +308,19 @@ impl Viewport {
         }
         let data = &model.data;
         let layers = o.layers(data);
-        let selection = if o.show_bed {
-            None
-        } else {
-            model.scene.selection(data, layers.clone(), o.show_travel)
-        };
-        let bounds = selection.as_ref().map_or(data.bounds, |s| s.bounds());
+        let selection = model.scene.selection(data, layers.clone(), o.show_travel);
         let bed = [data.bed_x, data.bed_y];
-        let mut p = Projection::new(bounds, bed, o)?;
-        if let Some(subject) = selection {
-            subject.fit(&mut p, o);
-        }
+        let p = Projection::framed(
+            selection.as_ref().map(|s| s.bounds()),
+            bed,
+            o,
+            None,
+            |p, screen| {
+                if let Some(subject) = selection {
+                    subject.project(p, screen);
+                }
+            },
+        )?;
         let vec4 = |v: [f64; 3], w: f64| [v[0] as f32, v[1] as f32, v[2] as f32, w as f32];
         // Reversed floating-point depth preserves precision in perspective even
         // when a distant purge line makes the visible depth range unusually large.

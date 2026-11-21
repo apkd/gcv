@@ -86,16 +86,46 @@ impl Subject {
         })
     }
 
-    pub fn fit(&self, p: &mut Projection, options: &RenderOptions, legend: Option<&Legend>) {
-        let mut screen = ScreenBounds::default();
+    pub fn project(&self, p: &Projection, screen: &mut ScreenBounds) {
         for &b in &self.blocks {
             screen.include(p, b);
         }
-        screen.fit(p, options, legend);
     }
 }
 
-struct ScreenBounds {
+impl Projection {
+    pub(super) fn framed(
+        subject: Option<Bounds>,
+        bed: [f64; 2],
+        options: &RenderOptions,
+        legend: Option<&Legend>,
+        project: impl FnOnce(&Self, &mut ScreenBounds),
+    ) -> Result<Self, super::RenderError> {
+        let origin = Bounds {
+            min: [0.; 3],
+            max: [0.; 3],
+        };
+        let mut p = Self::new(subject.unwrap_or(origin), bed, options)?;
+        let mut screen = ScreenBounds::default();
+        if options.show_bed {
+            screen.include(
+                &p,
+                Bounds {
+                    max: [bed[0], bed[1], 0.],
+                    ..origin
+                },
+            );
+        }
+        // Most prints fit inside the projected plate without extending its frame.
+        if subject.is_some_and(|b| !options.show_bed || !screen.contains(&p, b)) {
+            project(&p, &mut screen);
+        }
+        screen.fit(&mut p, options, legend);
+        Ok(p)
+    }
+}
+
+pub(super) struct ScreenBounds {
     min: [f64; 2],
     max: [f64; 2],
 }
@@ -108,6 +138,20 @@ impl Default for ScreenBounds {
     }
 }
 impl ScreenBounds {
+    fn contains(&self, p: &Projection, b: Bounds) -> bool {
+        corners(b).into_iter().all(|pt| {
+            let [x, y, z] = p.camera_point(pt);
+            // A coarse box can extend beyond the selection and cross the camera.
+            if p.perspective && z <= 0. {
+                return false;
+            }
+            let factor = if p.perspective { 1. / z } else { 1. };
+            [x * factor, -y * factor]
+                .into_iter()
+                .enumerate()
+                .all(|(i, v)| self.min[i] <= v && v <= self.max[i])
+        })
+    }
     fn include(&mut self, p: &Projection, b: Bounds) {
         for pt in corners(b) {
             let [x, y, z] = p.camera_point(pt);
@@ -147,9 +191,18 @@ impl ScreenBounds {
                 return None;
             }
             let half = size.map(|s| s * scale * 0.5);
+            // Keep the orbit pivot centered on the plate view when space permits.
+            let preferred = |i: usize, dim: f64| {
+                dim * 0.5
+                    + if options.show_bed {
+                        (min[i] + max[i]) * 0.5 * scale
+                    } else {
+                        0.
+                    }
+            };
             let center = [
-                (w * 0.5).max(left + half[0]).min(w - px - half[0]),
-                (h * 0.5).max(top + half[1]).min(h - py - half[1]),
+                preferred(0, w).max(left + half[0]).min(w - px - half[0]),
+                preferred(1, h).max(top + half[1]).min(h - py - half[1]),
             ];
             Some((scale, center))
         };
@@ -172,8 +225,11 @@ impl ScreenBounds {
             .or_else(|| fit(px, py));
         if let Some((scale, center)) = frame {
             p.scale = scale * options.camera.zoom;
+            // Zoom the plate about its orbit pivot; zoom a bedless print about
+            // the center of its projected silhouette.
+            let offset_scale = if options.show_bed { scale } else { p.scale };
             for i in 0..2 {
-                p.screen_center[i] = center[i] - (min[i] + max[i]) * 0.5 * p.scale
+                p.screen_center[i] = center[i] - (min[i] + max[i]) * 0.5 * offset_scale
                     + options.camera.pan[i] * [w, h][i];
             }
         }
@@ -208,9 +264,14 @@ mod tests {
                 for &[start, end] in points.as_chunks::<2>().0 {
                     subject.include(role, start, end, None);
                 }
-                let mut p =
-                    Projection::new(subject.bounds().unwrap(), [100.; 2], &options).unwrap();
-                subject.fit(&mut p, &options, Some(&legend));
+                let p = Projection::framed(
+                    subject.bounds(),
+                    [100.; 2],
+                    &options,
+                    Some(&legend),
+                    |p, s| subject.project(p, s),
+                )
+                .unwrap();
                 let projected = points.map(|pt| p.project(pt).unwrap());
                 assert!(projected.iter().all(|pt| pt.x > 0.
                     && pt.x < f64::from(width)

@@ -1,6 +1,6 @@
 //! Frame any layer range in groups of 64 visible strokes, as in the PNG export.
 //! Precomputed world bounds reject interior groups before we visit their strokes.
-use super::{BLOCK, Bounds, Projection, RenderOptions, Role, ScreenBounds, Segment};
+use super::{BLOCK, Bounds, Projection, Role, ScreenBounds, Segment};
 use std::ops::Range;
 
 const GROUP: usize = BLOCK * BLOCK;
@@ -150,7 +150,7 @@ impl Selection<'_> {
         result.unwrap()
     }
 
-    pub fn fit(&self, p: &mut Projection, options: &RenderOptions) {
+    pub(in crate::renderer) fn project(&self, p: &Projection, screen: &mut ScreenBounds) {
         let shift = self.range.start % BLOCK;
         let first = self.range.start / BLOCK;
         let end = first + self.range.len().div_ceil(BLOCK);
@@ -163,21 +163,6 @@ impl Selection<'_> {
                 self.exact(start..(start + BLOCK).min(self.range.end))
             }
         };
-        let extends = |screen: &ScreenBounds, b| {
-            super::corners(b).into_iter().any(|pt| {
-                let [x, y, z] = p.camera_point(pt);
-                // An outer box can extend beyond the selection and cross the camera.
-                if p.perspective && z <= 0. {
-                    return true;
-                }
-                let scale = if p.perspective { 1. / z } else { 1. };
-                [x * scale, -y * scale]
-                    .into_iter()
-                    .enumerate()
-                    .any(|(i, v)| v < screen.min[i] || v > screen.max[i])
-            })
-        };
-        let mut screen = ScreenBounds::default();
         for i in (first..end).step_by((end - first).div_ceil(32)) {
             screen.include(p, exact(i));
         }
@@ -190,28 +175,25 @@ impl Selection<'_> {
             {
                 outer = union(outer, b);
             }
-            if !extends(&screen, outer) {
+            if screen.contains(p, outer) {
                 continue;
             }
             for i in (group * BLOCK).max(first)..next.min(end) {
                 if shift != 0
-                    && !extends(
-                        &screen,
-                        fine.get(i + 1).map_or(fine[i], |&b| union(fine[i], b)),
-                    )
+                    && screen.contains(p, fine.get(i + 1).map_or(fine[i], |&b| union(fine[i], b)))
                 {
                     continue;
                 }
                 screen.include(p, exact(i));
             }
         }
-        screen.fit(p, options, None);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::renderer::RenderOptions;
     use crate::{parser::parse_gcode, renderer::framing::Subject, types::ExtrusionType};
 
     #[test]
@@ -247,11 +229,22 @@ mod tests {
                         ..Default::default()
                     };
                     o.camera.perspective = perspective;
-                    let camera = || Projection::new(selected.bounds(), [200.; 2], &o).unwrap();
-                    let (mut a, mut b) = (camera(), camera());
-                    cpu.fit(&mut a, &o, None);
-                    selected.fit(&mut b, &o);
-                    assert_eq!((a.scale, a.screen_center), (b.scale, b.screen_center));
+                    for bed in [false, true] {
+                        o.show_bed = bed;
+                        let a = Projection::framed(cpu.bounds(), [200.; 2], &o, None, |p, s| {
+                            cpu.project(p, s)
+                        })
+                        .unwrap();
+                        let b = Projection::framed(
+                            Some(selected.bounds()),
+                            [200.; 2],
+                            &o,
+                            None,
+                            |p, s| selected.project(p, s),
+                        )
+                        .unwrap();
+                        assert_eq!((a.scale, a.screen_center), (b.scale, b.screen_center));
+                    }
                 }
             }
         }

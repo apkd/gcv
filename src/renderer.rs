@@ -752,14 +752,14 @@ impl Legend {
 }
 
 fn canvas(
-    bounds: Bounds,
     bed: [f64; 2],
     options: &RenderOptions,
     subject: &Subject,
     legend: Option<&Legend>,
 ) -> Result<(Raster, Projection), RenderError> {
-    let mut projection = Projection::new(subject.bounds().unwrap_or(bounds), bed, options)?;
-    subject.fit(&mut projection, options, legend);
+    let projection = Projection::framed(subject.bounds(), bed, options, legend, |p, s| {
+        subject.project(p, s)
+    })?;
     let mut raster = Raster::new(options.width, options.height)?;
     if options.show_bed {
         draw_bed(&mut raster, &projection, bed);
@@ -770,16 +770,11 @@ fn canvas(
 pub fn render(toolpath: &ToolpathData, options: &RenderOptions) -> Result<Frame, RenderError> {
     options.validate()?;
     let segments = toolpath.layers.range(options.layers(toolpath));
-    let subject = if options.show_bed {
-        Subject::default()
-    } else {
-        Subject::from_segments(segments, options.show_travel)
-    };
+    let subject = Subject::from_segments(segments, options.show_travel);
     let legend = Legend::new(options, || {
         colors::legend_entries(toolpath, options.color_mode, options.show_travel)
     });
     let (mut raster, projection) = canvas(
-        toolpath.bounds,
         [toolpath.bed_x, toolpath.bed_y],
         options,
         &subject,
