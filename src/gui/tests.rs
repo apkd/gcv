@@ -42,7 +42,51 @@ fn viewer() -> Option<Gcv> {
             show_travel: true,
             ..Default::default()
         },
+        1.0,
     ))
+}
+
+#[test]
+fn render_scale_resizes_the_texture_without_resizing_the_panel() {
+    use eframe::{App, egui::pos2};
+    let Some(mut app) = viewer() else { return };
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut draw = |scale| {
+        app.render_scale = scale;
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                pos2(0., 0.),
+                Vec2::new(800., 500.),
+            )),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .native_pixels_per_point = Some(2.);
+        let out = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+        let panel = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Mesh(m) if matches!(m.texture_id, egui::TextureId::User(_)) => {
+                    Some(m.calc_bounds())
+                }
+                _ => None,
+            })
+            .unwrap();
+        (panel, app.viewport.texture_size())
+    };
+    let (panel, full) = draw(1.);
+    let (scaled_panel, half) = draw(0.5);
+    assert_eq!(panel, scaled_panel);
+    let dimensions = |density: f32| {
+        [panel.width(), panel.height()].map(|points| (points * density).round() as u32)
+    };
+    assert_eq!(full, dimensions(2.0));
+    assert_eq!(half, dimensions(1.0));
 }
 
 #[test]

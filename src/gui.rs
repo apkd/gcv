@@ -27,6 +27,7 @@ pub struct Gcv {
     filename: PathBuf,
     input_path: String,
     options: RenderOptions,
+    render_scale: f32,
     export_size: [u32; 2],
     export_legend: bool,
     events_tx: mpsc::Sender<Event>,
@@ -45,6 +46,7 @@ impl Gcv {
         data: ToolpathData,
         filename: PathBuf,
         mut options: RenderOptions,
+        render_scale: f32,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::channel();
         let export_size = [options.width, options.height];
@@ -61,6 +63,7 @@ impl Gcv {
             input_path: filename.to_string_lossy().into_owned(),
             filename,
             options,
+            render_scale,
             export_size,
             export_legend,
             events_tx,
@@ -433,7 +436,8 @@ impl eframe::App for Gcv {
                     self.set_camera(CameraPreset::Isometric);
                 }
                 let max = self.viewport.state.device.limits().max_texture_dimension_2d as f32;
-                let factor = ctx.pixels_per_point().min(max / size.x.max(size.y));
+                let factor =
+                    (ctx.pixels_per_point() * self.render_scale).min(max / size.max_elem());
                 let width = (size.x * factor).round().max(1.0) as u32;
                 let height = (size.y * factor).round().max(1.0) as u32;
                 if self.options.width != width || self.options.height != height {
@@ -489,7 +493,12 @@ impl eframe::App for Gcv {
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub fn run_app(data: ToolpathData, filename: PathBuf, options: RenderOptions) -> eframe::Result {
+pub fn run_app(
+    data: ToolpathData,
+    filename: PathBuf,
+    options: RenderOptions,
+    render_scale: f32,
+) -> eframe::Result {
     let title = format!(
         "gcv — {}",
         filename.file_name().unwrap_or_default().to_string_lossy()
@@ -511,6 +520,7 @@ pub fn run_app(data: ToolpathData, filename: PathBuf, options: RenderOptions) ->
                 data,
                 filename,
                 options,
+                render_scale,
             )))
         }),
     )

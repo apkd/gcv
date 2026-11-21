@@ -77,7 +77,7 @@ gcv model.gcode -e output.png \
 | `--no-bed` | off | Hide print bed |
 | `--color-mode` | `feature` | `feature`, `height`, `speed`, `fan`, `temperature`, `flow` |
 | `--min-layer` | 0 | Minimum layer to display |
-| `--scale`, `-s` | 1 | Multiply export dimensions |
+| `--scale`, `-s` | 1 | Scale viewport and PNG resolution (e.g. `0.5` for half width and height) |
 | `--no-legend` | off | Hide the legend |
 | `--orthographic` | off | Use an orthographic camera |
 | `--stats` | off | Print toolpath statistics as JSON |

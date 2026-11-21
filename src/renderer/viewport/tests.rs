@@ -45,6 +45,13 @@ fn pixels(v: &Viewport) -> Vec<u8> {
         .collect()
 }
 
+impl Viewport {
+    pub(crate) fn texture_size(&self) -> [u32; 2] {
+        let image = &self.target.as_ref().unwrap().image;
+        [image.width(), image.height()]
+    }
+}
+
 #[test]
 fn viewport_agrees_with_png_across_display_controls() {
     let Some(state) = gpu() else { return };

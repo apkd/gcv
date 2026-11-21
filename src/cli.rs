@@ -52,7 +52,7 @@ pub struct Args {
     /// feature, height, speed, fan, temperature, flow
     #[arg(long, default_value = "feature")]
     pub color_mode: ColorMode,
-    /// Multiply export dimensions by this positive finite factor
+    /// Scale the viewport render resolution and PNG export dimensions
     #[arg(long, short = 's', default_value = "1", value_parser = positive_number)]
     pub scale: f64,
     /// Hide the legend in exported PNGs
@@ -247,7 +247,7 @@ pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
     }
     #[cfg(feature = "gui")]
     {
-        crate::gui::run_app(toolpath, args.file, options)
+        crate::gui::run_app(toolpath, args.file, options, args.scale as f32)
             .map_err(|e| format!("desktop viewer: {e}"))?;
         Ok(())
     }
