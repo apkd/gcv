@@ -15,7 +15,7 @@
 
 ## Installation
 
-Download a Linux binary from the [rolling release](https://github.com/apkd/gcv/releases/tag/release), or install from source:
+Download a Windows x64 or Linux x64/ARM64 binary from the [rolling release](https://github.com/apkd/gcv/releases/tag/release), or install from source:
 
 ```bash
 cargo install --path . --locked

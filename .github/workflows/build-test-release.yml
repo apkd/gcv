@@ -29,6 +29,13 @@ env:
   CARGO_INCREMENTAL: '0'
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
+  RELEASE_FILES: |-
+    gcv-linux-x64
+    gcv-linux-x64.debug
+    gcv-linux-arm64
+    gcv-linux-arm64.debug
+    gcv-windows-x64.exe
+    gcv-windows-x64.pdb
 jobs:
   test:
     strategy:
@@ -93,7 +100,7 @@ jobs:
           archived_versions=''
           if [[ -n "$archive_id" ]]; then
             archived_versions="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$archive_id/assets?per_page=100" \
-              --jq '.[] | .name | capture("-(?<version>[0-9]+\\.[0-9]+\\.[0-9]+)-linux-(x64|arm64)$") | .version')"
+              --jq '.[] | .name | capture("^gcv-(?<version>[0-9]+\\.[0-9]+\\.[0-9]+)-") | .version')"
           fi
           current="$(printf '%s\n' "$current" "$archived_versions" | sort -V | tail -n 1)"
           IFS='.' read -r major minor patch <<< "$current"
@@ -118,12 +125,22 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            arch: x64
+            binary: gcv-linux-x64
+            symbols: gcv-linux-x64.debug
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            arch: arm64
+            binary: gcv-linux-arm64
+            symbols: gcv-linux-arm64.debug
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: gcv-windows-x64.exe
+            symbols: gcv-windows-x64.pdb
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      BINARY: ${{ matrix.binary }}
+      SYMBOLS: ${{ matrix.symbols }}
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -131,11 +148,13 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux desktop development packages
+        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev
       - name: Build release binary
         env:
           VERSION: ${{ needs.plan-release.outputs.version }}
-          CARGO_BUILD_TARGET: ${{ matrix.target }}
+          # Let Windows debuggers find the published PDB beside the executable.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static -C link-arg=/PDBALTPATH:${{ matrix.symbols }}
           CARGO_PROFILE_RELEASE_DEBUG: '2'
           CARGO_PROFILE_RELEASE_STRIP: none
         run: |
@@ -143,32 +162,45 @@ jobs:
           sed -i '/^name = "gcv"$/,/^\[\[package\]\]$/s/^version = ".*"$/version = "'"$VERSION"'"/' Cargo.lock
           cargo build --locked --release --target "$CARGO_BUILD_TARGET" --bin gcv
           mkdir -p release-assets
-          cp "target/$CARGO_BUILD_TARGET/release/gcv" release-assets/gcv-linux-${{ matrix.arch }}
-          executable="release-assets/gcv-linux-${{ matrix.arch }}"
+      - name: Package Linux binary and symbols
+        if: runner.os == 'Linux'
+        run: |
+          executable="release-assets/$BINARY"
+          cp "target/$CARGO_BUILD_TARGET/release/gcv" "$executable"
           objcopy --only-keep-debug --compress-debug-sections=zlib-gabi "$executable" "$executable.debug"
           strip --strip-all "$executable"
           objcopy --add-gnu-debuglink="$executable.debug" "$executable"
+      - name: Package Windows binary and symbols
+        if: runner.os == 'Windows'
+        run: |
+          cp "target/$CARGO_BUILD_TARGET/release/gcv.exe" "release-assets/$BINARY"
+          cp "target/$CARGO_BUILD_TARGET/release/gcv.pdb" "release-assets/$SYMBOLS"
       - name: Smoke-test the release binary
         env:
           VERSION: ${{ needs.plan-release.outputs.version }}
         run: |
-          executable="$PWD/release-assets/gcv-linux-${{ matrix.arch }}"
-          [[ "$("$executable" --version)" == "gcv $VERSION" ]]
+          executable="./release-assets/$BINARY"
+          test -s "release-assets/$SYMBOLS"
+          [[ "$("$executable" --version | tr -d '\r')" == "gcv $VERSION" ]]
           input=tests/fixtures/bgcode/heatshrink12-meatpack-v1.bgcode
           "$executable" "$input" --stats | jq -e '.total_segments > 0'
-          env -u DISPLAY -u WAYLAND_DISPLAY "$executable" "$input" --no-bed -r 320x225 -e "$RUNNER_TEMP/preview.png"
-          file "$RUNNER_TEMP/preview.png" | grep -F 'PNG image data, 320 x 225'
+          png="$RUNNER_TEMP/preview.png"
+          env -u DISPLAY -u WAYLAND_DISPLAY "$executable" "$input" --no-bed -r 320x225 -e "$png"
+          # PNG signature and IHDR, followed by the width and height.
+          printf '\211PNG\r\n\032\n\0\0\0\rIHDR' | cmp -n 16 - "$png"
+          read -r width height < <(od -An -tu4 --endian=big -j16 -N8 "$png")
+          [[ "$width" == 320 && "$height" == 225 ]]
       - uses: actions/upload-artifact@v6
         with:
-          name: gcv-linux-${{ matrix.arch }}
+          name: ${{ matrix.binary }}
           path: |
-            release-assets/gcv-linux-${{ matrix.arch }}
-            release-assets/gcv-linux-${{ matrix.arch }}.debug
+            release-assets/${{ matrix.binary }}
+            release-assets/${{ matrix.symbols }}
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
       - uses: actions/upload-artifact@v6
-        if: matrix.arch == 'x64'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         with:
           name: release-version
           path: |
@@ -193,7 +225,7 @@ jobs:
           path: ${{ runner.temp }}/release-version
       - uses: actions/download-artifact@v8
         with:
-          pattern: gcv-linux-*
+          pattern: gcv-*
           merge-multiple: true
           path: release-assets
       - name: Archive, commit and tag the tested version
@@ -215,7 +247,7 @@ jobs:
           archive_tag="$(gh api --paginate "$api/releases?per_page=100" --jq '.[] | select(.tag_name == "build-archive") | .tag_name')"
           if [[ -z "$archive_tag" ]]; then
             gh release create build-archive --target "$GITHUB_SHA" --latest=false \
-              --title 'Build archive' --notes 'Versioned Linux binaries and debug symbols.'
+              --title 'Build archive' --notes 'Versioned binaries and debug symbols.'
           fi
           archive="$(gh api "$api/releases/tags/build-archive")"
           jq -e '.draft == false and .prerelease == false and (.immutable != true)' <<< "$archive" >/dev/null \
@@ -249,12 +281,9 @@ jobs:
             fi
             [[ "$recorded_digest" == "$digest" ]] || fail "Archived bytes differ: $name. Nothing will be overwritten."
           }
-          for arch in x64 arm64; do
-            binary="release-assets/gcv-linux-$arch"
-            name="gcv-$VERSION-linux-$arch"
-            archive_asset "$binary" "$name"
-            archive_asset "$binary.debug" "$name.debug"
-          done
+          while IFS= read -r file; do
+            archive_asset "release-assets/$file" "gcv-$VERSION-${file#gcv-}"
+          done <<< "$RELEASE_FILES"
           cp "$RUNNER_TEMP/release-version/Cargo.toml" Cargo.toml
           cp "$RUNNER_TEMP/release-version/Cargo.lock" Cargo.lock
           git config user.name 'github-actions[bot]'
@@ -290,7 +319,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
-          pattern: gcv-linux-*
+          pattern: gcv-*
           merge-multiple: true
           path: release-assets
       - name: Prepare release notes
@@ -310,9 +339,9 @@ jobs:
 
           Installation
           --------------
-          Compatibility: ***Linux x64 and ARM64 (built on Ubuntu 24.04 with glibc)***
+          Windows x64: [Download gcv-windows-x64.exe]($repo_url/releases/download/release/gcv-windows-x64.exe)
 
-          Download and run the binary:
+          Linux x64 and ARM64 (built on Ubuntu 24.04 with glibc). To run on x64:
 
           \`\`\`sh
           curl -fL -o gcv $repo_url/releases/download/release/gcv-linux-x64
@@ -389,8 +418,8 @@ jobs:
       - name: Create or update rolling release
         if: steps.verify.outputs.changed == 'false'
         run: |
-          files=(release-assets/gcv-linux-x64 release-assets/gcv-linux-x64.debug
-                 release-assets/gcv-linux-arm64 release-assets/gcv-linux-arm64.debug)
+          mapfile -t names <<< "$RELEASE_FILES"
+          files=("${names[@]/#/release-assets/}")
           for file in "${files[@]}"; do test -s "$file"; done
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -406,10 +435,9 @@ jobs:
           assets="$(gh release view release --json assets)"
           mapfile -t published < <(jq -r '.assets[].name' <<< "$assets")
           for asset in "${published[@]}"; do
-            case "$asset" in
-              gcv-linux-x64|gcv-linux-x64.debug|gcv-linux-arm64|gcv-linux-arm64.debug) ;;
-              *) gh release delete-asset release "$asset" --yes ;;
-            esac
+            if ! grep -Fxq -- "$asset" <<< "$RELEASE_FILES"; then
+              gh release delete-asset release "$asset" --yes
+            fi
           done
 
           info="$(gh release view release --json apiUrl,publishedAt)"
