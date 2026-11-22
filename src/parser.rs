@@ -6,7 +6,7 @@
 //! remain independent, as in gcode-lib. XYZ G92 uses programmed coordinates;
 //! it does not simulate machine work offsets. Arc chords are at most 0.2 mm
 //! and 5 degrees. Unlike upstream, pure Z moves are included as travel lines.
-use crate::geometry::{FeaturePaths, Geometry, PlanarArc, Print};
+use crate::geometry::{FeaturePaths, Geometry, PlanarArc, PreviewPaths, Print};
 use crate::types::LayerTable;
 use crate::types::{Bounds, Diagnostic, ExtrusionType, Segment, ToolpathData};
 use std::{
@@ -229,9 +229,16 @@ struct Builder<G> {
     diagnostics: Vec<(String, Diagnostic)>,
 }
 impl<G: Geometry> Builder<G> {
-    fn new() -> Self {
+    #[cfg(test)]
+    fn new() -> Self
+    where
+        G: Default,
+    {
+        Self::with_geometry(G::default())
+    }
+    fn with_geometry(geometry: G) -> Self {
         Self {
-            geometry: G::default(),
+            geometry,
             z: 0.0,
             index: 0,
             group_has_lines: false,
@@ -345,7 +352,7 @@ pub(crate) fn parse_detailed(
     text: &str,
     info: Option<&mut crate::print_info::Collector>,
 ) -> Result<ToolpathData, ParseError> {
-    let p = interpret::<LayerTable>(text, info, parallel::read)?;
+    let p = interpret(text, info, LayerTable::default)?;
     Ok(ToolpathData {
         layers: p.geometry,
         bounds: p.bounds,
@@ -360,7 +367,15 @@ pub(crate) fn parse_features(
     text: &str,
     info: Option<&mut crate::print_info::Collector>,
 ) -> Result<Print<FeaturePaths>, ParseError> {
-    interpret(text, info, parallel::read)
+    interpret(text, info, FeaturePaths::default)
+}
+
+pub(crate) fn parse_preview(
+    text: &str,
+    info: Option<&mut crate::print_info::Collector>,
+    mode: crate::types::ColorMode,
+) -> Result<Print<PreviewPaths>, ParseError> {
+    interpret(text, info, || PreviewPaths::new(mode))
 }
 
 const MAX_DIAGNOSTICS: usize = 128;
@@ -368,13 +383,7 @@ const MAX_DIAGNOSTICS: usize = 128;
 fn interpret<G: Geometry>(
     text: &str,
     info: Option<&mut crate::print_info::Collector>,
-    read: impl FnOnce(
-        &str,
-        Option<&mut crate::print_info::Collector>,
-        &mut State,
-        &mut Builder<G>,
-    ) -> Result<usize, ParseError>
-    + Send,
+    section: impl Fn() -> G + Sync,
 ) -> Result<Print<G>, ParseError> {
     if memchr::memchr(0, text.as_bytes()).is_some() {
         return Err(error(
@@ -384,8 +393,8 @@ fn interpret<G: Geometry>(
     }
     let text = text.trim_start_matches('\u{feff}');
     let parse = |mut state| {
-        let mut builder = Builder::<G>::new();
-        read(text, info, &mut state, &mut builder)?;
+        let mut builder = Builder::with_geometry(section());
+        parallel::read(text, info, &mut state, &mut builder, &section)?;
         Ok::<_, ParseError>(builder)
     };
     // Only flow depends on the filament diameter. A feature preview can

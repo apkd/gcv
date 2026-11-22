@@ -3,6 +3,7 @@
 //! Lines are clipped before rasterization and use analytic edge coverage and a
 //! depth buffer. Export needs neither a GPU, a window server, nor a font install.
 use std::{error::Error, fmt};
+mod bands;
 mod features;
 mod framing;
 mod summary;
@@ -13,7 +14,8 @@ use framing::{Role, Subject};
 
 use crate::{
     camera::Camera,
-    colors::{self, BACKGROUND, ColorRanges, TRAVEL_OPACITY},
+    colors::{self, BACKGROUND, TRAVEL_OPACITY},
+    geometry::{PreviewLine, PreviewPaths, Print},
     types::{Bounds, ColorMode, ToolpathData},
 };
 
@@ -55,8 +57,7 @@ impl Default for RenderOptions {
 }
 
 impl RenderOptions {
-    fn layers(&self, data: &ToolpathData) -> std::ops::Range<usize> {
-        let n = data.total_layers();
+    fn layers(&self, n: usize) -> std::ops::Range<usize> {
         let end = self
             .layer_max
             .map_or(n, |last| last.saturating_add(1).min(n));
@@ -340,8 +341,11 @@ impl Band<'_> {
             rgb.copy_from_slice(&color);
             return;
         }
+        // Round coverage once, then mix each channel with one multiply.
+        let weight = (alpha * 65_536. + 0.5) as i32;
         for (dst, src) in rgb.iter_mut().zip(color) {
-            *dst = (f64::from(src) * alpha + f64::from(*dst) * (1.0 - alpha) + 0.5) as u8;
+            let base = i32::from(*dst);
+            *dst = (base + (((i32::from(src) - base) * weight + 32_768) >> 16)) as u8;
         }
     }
 
@@ -349,6 +353,27 @@ impl Band<'_> {
         &mut self,
         a: ScreenPoint,
         b: ScreenPoint,
+        resolve: impl FnMut() -> [u8; 3],
+        width: f64,
+        opacity: f64,
+        write_depth: bool,
+    ) {
+        let Some(points) = clip_line(
+            a,
+            b,
+            f64::from(self.width),
+            f64::from(self.height),
+            width * 0.5 + 1.0,
+        ) else {
+            return;
+        };
+        self.paint(points, 0, resolve, width, opacity, write_depth);
+    }
+
+    fn paint(
+        &mut self,
+        [a, b]: [ScreenPoint; 2],
+        first_row: u32,
         mut resolve: impl FnMut() -> [u8; 3],
         width: f64,
         opacity: f64,
@@ -356,15 +381,6 @@ impl Band<'_> {
     ) {
         let mut color = None;
         let radius = width * 0.5;
-        let Some([a, b]) = clip_line(
-            a,
-            b,
-            f64::from(self.width),
-            f64::from(self.height),
-            radius + 1.0,
-        ) else {
-            return;
-        };
         let dx = b.x - a.x;
         let dy = b.y - a.y;
         let length_squared = dx * dx + dy * dy;
@@ -381,8 +397,8 @@ impl Band<'_> {
         let max_metric = a.metric.max(a.metric + (b.metric - a.metric)) as f32;
         let left = ((a.x.min(b.x) - outer + 0.5) as i32).max(0);
         let right = ((a.x.max(b.x) + outer + 0.5) as i32).min(w as i32);
-        let rows = ((a.y.min(b.y) - outer + 0.5) as i32).max(0)
-            ..((a.y.max(b.y) + outer + 0.5) as i32).min(h as i32);
+        let rows = ((a.y.min(b.y) - outer + 0.5) as i32).max(first_row as i32)
+            ..((a.y.max(b.y) + outer + 0.5) as i32).min((first_row + h) as i32);
         // The capsule lies inside both its endpoint box and the strip around
         // its infinite center line. Short moves need only the box.
         let narrow = dy.abs() > 2.0 && dx.abs() > 2.0;
@@ -399,7 +415,7 @@ impl Band<'_> {
                 left..right
             };
             for x in xs {
-                let pixel = y as usize * w as usize + x as usize;
+                let pixel = (y as usize - first_row as usize) * w as usize + x as usize;
                 if max_metric < self.depth[pixel] {
                     continue;
                 }
@@ -552,7 +568,25 @@ impl Raster {
 
 /// Liang–Barsky clipping bounds all raster loops, including giant offscreen
 /// coordinates and camera pans. The depth attribute is clipped consistently.
+#[inline]
 fn clip_line(
+    a: ScreenPoint,
+    b: ScreenPoint,
+    width: f64,
+    height: f64,
+    margin: f64,
+) -> Option<[ScreenPoint; 2]> {
+    if [a, b].into_iter().all(|p| {
+        (-margin..=width + margin).contains(&p.x)
+            && (-margin..=height + margin).contains(&p.y)
+            && p.metric.is_finite()
+    }) {
+        return Some([a, b]);
+    }
+    clip_crossing(a, b, width, height, margin)
+}
+
+fn clip_crossing(
     a: ScreenPoint,
     b: ScreenPoint,
     width: f64,
@@ -569,13 +603,6 @@ fn clip_line(
     let dy = b.y - a.y;
     if !dx.is_finite() || !dy.is_finite() {
         return None;
-    }
-    if a.x.min(b.x) >= -margin
-        && a.y.min(b.y) >= -margin
-        && a.x.max(b.x) <= width + margin
-        && a.y.max(b.y) <= height + margin
-    {
-        return Some([a, b]);
     }
     let mut low = 0.0_f64;
     let mut high = 1.0_f64;
@@ -807,35 +834,101 @@ fn canvas(
 }
 
 pub fn render(toolpath: &ToolpathData, options: &RenderOptions) -> Result<Frame, RenderError> {
-    render_with_info(toolpath, options, None)
+    let chunks: Vec<_> = toolpath
+        .layers
+        .range(options.layers(toolpath.total_layers()))
+        .chunks(4096)
+        .collect();
+    render_lines(
+        [toolpath.bed_x, toolpath.bed_y],
+        toolpath.bounds,
+        options,
+        None,
+        toolpath.segments().map(|s| {
+            (
+                s.extrusion_type,
+                s.is_travel,
+                colors::segment_value(s, options.color_mode),
+            )
+        }),
+        &chunks,
+        |&chunk| {
+            chunk
+                .iter()
+                .map(|s| PreviewLine::from_segment(s, options.color_mode))
+        },
+    )
 }
 
-pub(crate) fn render_with_info(
-    toolpath: &ToolpathData,
+pub(crate) fn render_preview(
+    print: &Print<PreviewPaths>,
     options: &RenderOptions,
     info: Option<&crate::print_info::PrintInfo>,
 ) -> Result<Frame, RenderError> {
-    options.validate()?;
-    let segments = toolpath.layers.range(options.layers(toolpath));
-    let subject = Subject::from_segments(segments, options.show_travel);
-    let legend = Legend::new(options, info, || {
-        colors::legend_entries(toolpath, options.color_mode, options.show_travel)
-    });
-    let (mut raster, projection) = canvas(
-        [toolpath.bed_x, toolpath.bed_y],
+    let chunks: Vec<_> = print
+        .geometry
+        .chunks(options.layers(print.layers))
+        .collect();
+    let values = print
+        .geometry
+        .chunks(0..print.layers)
+        .flat_map(|c| c.values());
+    render_lines(
+        print.bed,
+        print.bounds,
         options,
-        &subject,
-        legend.as_ref(),
-    )?;
-    let ranges =
-        (options.color_mode != ColorMode::Feature).then(|| ColorRanges::from_toolpath(toolpath));
+        info,
+        values,
+        &chunks,
+        |chunk| chunk.lines(),
+    )
+}
+
+fn render_lines<C: Sync, I: ExactSizeIterator<Item = PreviewLine>>(
+    bed: [f64; 2],
+    bounds: Bounds,
+    options: &RenderOptions,
+    info: Option<&crate::print_info::PrintInfo>,
+    values: impl Iterator<Item = (crate::types::ExtrusionType, bool, f64)> + Send,
+    chunks: &[C],
+    lines: impl Fn(&C) -> I + Sync,
+) -> Result<Frame, RenderError> {
+    options.validate()?;
+    let frame = || Subject::from_lines(chunks, &lines, options.show_travel);
+    let colors = || {
+        colors::preview_colors(
+            values,
+            bounds,
+            options.color_mode,
+            options.show_legend,
+            options.show_travel,
+        )
+    };
+    let (subject, (range, entries)) = if chunks.len() >= 4 {
+        rayon::join(frame, colors)
+    } else {
+        (frame(), colors())
+    };
+    let legend = Legend::new(options, info, || entries);
+    let (mut raster, projection) = canvas(bed, options, &subject, legend.as_ref())?;
+    let serial = chunks.iter().map(|c| lines(c).len()).sum::<usize>() < 16_384;
     // Opaque extrusion first. Travels are then composited against the same depth
     // buffer but do not write it, so a translucent travel cannot hide a surface.
     for travel_pass in [false, true] {
         if travel_pass && !options.show_travel {
             continue;
         }
-        for segment in segments.iter().filter(|s| s.is_travel == travel_pass) {
+        let width = if travel_pass {
+            (options.line_width * 0.45).max(0.5)
+        } else {
+            options.line_width
+        };
+        let opacity = if travel_pass { TRAVEL_OPACITY } else { 1. };
+        let (viewport_width, viewport_height) = (
+            f64::from(raster.frame.width),
+            f64::from(raster.frame.height),
+        );
+        let project = |segment: PreviewLine| -> Result<_, RenderError> {
             if !segment
                 .start
                 .into_iter()
@@ -844,27 +937,53 @@ pub(crate) fn render_with_info(
             {
                 return Err(RenderError("segment coordinates must be finite".into()));
             }
-            let color = match &ranges {
-                Some(ranges) => colors::color_for_segment(segment, options.color_mode, ranges),
-                None => colors::feature_color(segment.extrusion_type),
+            let Some(points) = projection
+                .project_line(segment.start, segment.end)
+                .and_then(|[a, b]| {
+                    clip_line(a, b, viewport_width, viewport_height, width * 0.5 + 1.)
+                })
+            else {
+                return Ok(None);
+            };
+            let color = match options.color_mode {
+                ColorMode::Feature => colors::feature_color(segment.feature),
+                mode => colors::value_color(mode, range, segment.value),
             };
             let color = if travel_pass {
                 color
             } else {
                 tangent_color(color, segment.start, segment.end)
             };
-            raster.world_line(
-                &projection,
-                [segment.start, segment.end],
-                color,
-                if travel_pass {
-                    (options.line_width * 0.45).max(0.5)
-                } else {
-                    options.line_width
+            Ok(Some((points, color)))
+        };
+        let paint = |band: &mut Band<'_>, y, (points, color)| {
+            band.paint(points, y, || color, width, opacity, !travel_pass)
+        };
+        if serial {
+            for s in chunks
+                .iter()
+                .flat_map(&lines)
+                .filter(|s| s.travel == travel_pass)
+            {
+                if let Some(line) = project(s)? {
+                    paint(&mut raster.band(), 0, line);
+                }
+            }
+        } else {
+            bands::draw(
+                &mut raster,
+                width,
+                chunks,
+                |chunk, projected| {
+                    for s in lines(chunk).filter(|s| s.travel == travel_pass) {
+                        if let Some(line) = project(s)? {
+                            projected.push(line);
+                        }
+                    }
+                    Ok(())
                 },
-                if travel_pass { TRAVEL_OPACITY } else { 1.0 },
-                !travel_pass,
-            );
+                |band, y, line, _| paint(band, y, line),
+            )?;
         }
     }
     if let Some(legend) = legend {

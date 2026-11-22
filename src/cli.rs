@@ -194,17 +194,27 @@ fn check_selection(
 pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let options = args.render_options()?;
     let mut info = args.print_info.then(crate::print_info::Collector::default);
-    if let Some(destination) = &args.export
-        && options.color_mode == ColorMode::Feature
-        && !options.show_travel
-        && options.layer_min == 0
-        && options.layer_max.is_none()
-    {
-        let print = crate::load_with(&args.file, info.as_mut(), crate::parser::parse_features)?;
+    if let Some(destination) = &args.export {
+        if options.color_mode == ColorMode::Feature
+            && !options.show_travel
+            && options.layer_min == 0
+            && options.layer_max.is_none()
+        {
+            let print = crate::load_with(&args.file, info.as_mut(), crate::parser::parse_features)?;
+            check_selection(&args, print.layers, &print.diagnostics)?;
+            report(print.layers, print.segments, print.bed, &print.diagnostics);
+            return export(
+                renderer::render_features(&print, &options, info.map(|i| i.finish()).as_ref())?,
+                destination,
+            );
+        }
+        let print = crate::load_with(&args.file, info.as_mut(), |text, info| {
+            crate::parser::parse_preview(text, info, options.color_mode)
+        })?;
         check_selection(&args, print.layers, &print.diagnostics)?;
         report(print.layers, print.segments, print.bed, &print.diagnostics);
         return export(
-            renderer::render_features(&print, &options, info.map(|i| i.finish()).as_ref())?,
+            renderer::render_preview(&print, &options, info.map(|i| i.finish()).as_ref())?,
             destination,
         );
     }
@@ -247,11 +257,6 @@ pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
         [toolpath.bed_x, toolpath.bed_y],
         &toolpath.diagnostics,
     );
-    if let Some(destination) = &args.export {
-        let frame =
-            renderer::render_with_info(&toolpath, &options, info.map(|i| i.finish()).as_ref())?;
-        return export(frame, destination);
-    }
     #[cfg(feature = "gui")]
     {
         crate::gui::run_app(toolpath, args.file, options, args.scale as f32)

@@ -46,8 +46,13 @@ impl Cursor {
             && self.has_lines == other.has_lines
     }
 
-    fn read<G: Geometry>(&mut self, text: &str, limit: usize) -> Option<(Builder<G>, usize)> {
-        let mut builder = Builder::new();
+    fn read<G: Geometry>(
+        &mut self,
+        text: &str,
+        limit: usize,
+        geometry: G,
+    ) -> Option<(Builder<G>, usize)> {
+        let mut builder = Builder::with_geometry(geometry);
         builder.z = self.z;
         builder.group_has_lines = self.has_lines;
         builder.segment_limit = limit;
@@ -63,12 +68,14 @@ pub(super) fn read<G: Geometry>(
     info: Option<&mut Collector>,
     state: &mut State,
     out: &mut Builder<G>,
+    section: &(impl Fn() -> G + Sync),
 ) -> Result<usize, ParseError> {
     if text.len() < CHUNK || rayon::current_num_threads() == 1 {
         return read_lines(text, info, state, out);
     }
-    let mut parse =
-        || parallel(text, state, out).map_or_else(|| read_lines(text, None, state, out), Ok);
+    let mut parse = || {
+        parallel(text, state, out, section).map_or_else(|| read_lines(text, None, state, out), Ok)
+    };
     if let Some(info) = info {
         rayon::join(parse, || info.scan(text)).0
     } else {
@@ -104,7 +111,12 @@ fn checkpoints(bytes: &[u8], marker: &[u8], max_stride: usize) -> Vec<(usize, us
     joins
 }
 
-fn parallel<G: Geometry>(text: &str, state: &State, out: &mut Builder<G>) -> Option<usize> {
+fn parallel<G: Geometry>(
+    text: &str,
+    state: &State,
+    out: &mut Builder<G>,
+    section: &(impl Fn() -> G + Sync),
+) -> Option<usize> {
     let bytes = text.as_bytes();
     // Give large, detailed prints more workers without growing the budget
     // for unverified geometry. Small inputs keep the existing section size.
@@ -130,7 +142,7 @@ fn parallel<G: Geometry>(text: &str, state: &State, out: &mut Builder<G>) -> Opt
     // more, the serial parser enforces the file-wide limit and exact error line.
     let budget = |n: usize| (MAX_SEGMENTS as u64 * n as u64 / bytes.len() as u64) as usize;
     let mut seed = Cursor::at(state, out);
-    let (mut joined, mut offset) = seed.read::<G>(&text[..joins[0].1], budget(joins[0].1))?;
+    let (mut joined, mut offset) = seed.read(&text[..joins[0].1], budget(joins[0].1), section())?;
     if !resets && !seed.state.absolute_e {
         return None;
     }
@@ -163,7 +175,7 @@ fn parallel<G: Geometry>(text: &str, state: &State, out: &mut Builder<G>) -> Opt
                     {
                         cursor.state.feature = feature;
                     }
-                    cursor.read::<FeaturePaths>(&text[start..cut], overlap_limit)?;
+                    cursor.read(&text[start..cut], overlap_limit, FeaturePaths::default())?;
                 }
                 let entry = cursor.clone();
                 let end = section_end(base + i);
@@ -172,7 +184,7 @@ fn parallel<G: Geometry>(text: &str, state: &State, out: &mut Builder<G>) -> Opt
                 } else {
                     budget(end - cut)
                 };
-                let part = cursor.read(&text[cut..end], limit)?;
+                let part = cursor.read(&text[cut..end], limit, section())?;
                 Some((entry, cursor, part))
             })
             .collect();
@@ -189,7 +201,7 @@ fn parallel<G: Geometry>(text: &str, state: &State, out: &mut Builder<G>) -> Opt
                 } else {
                     remaining
                 };
-                seed.read(&text[cuts[i].1..section_end(base + i)], limit)?
+                seed.read(&text[cuts[i].1..section_end(base + i)], limit, section())?
             };
             if part.arc_budget_peak > remaining || part.count > remaining {
                 return None;
@@ -259,12 +271,20 @@ mod tests {
             let mut reference = Builder::<FeaturePaths>::new();
             read_lines(&text, None, &mut State::default(), &mut reference).unwrap();
             let mut result = Builder::<FeaturePaths>::new();
-            assert!(parallel(&text, &State::default(), &mut result).is_some());
+            assert!(
+                parallel(
+                    &text,
+                    &State::default(),
+                    &mut result,
+                    &FeaturePaths::default
+                )
+                .is_some()
+            );
             let strokes = |g: FeaturePaths| {
                 g.batches.into_iter().flat_map(|batch| {
                     (0..batch.strokes.len()).map(move |i| {
                         let s = &batch.strokes[i];
-                        let [start, end] = *batch.endpoints(s.vertex);
+                        let [start, end] = batch.endpoints(s.vertex);
                         (
                             start,
                             end,
@@ -300,7 +320,10 @@ mod tests {
         let mut serial = Builder::<LayerTable>::new();
         let lines = read_lines(&text, None, &mut State::default(), &mut serial).unwrap();
         let mut joined = Builder::<LayerTable>::new();
-        assert_eq!(parallel(&text, &State::default(), &mut joined), Some(lines));
+        assert_eq!(
+            parallel(&text, &State::default(), &mut joined, &LayerTable::default),
+            Some(lines)
+        );
         for builder in [&mut serial, &mut joined] {
             builder.geometry.finish(builder.z);
         }
@@ -315,6 +338,33 @@ mod tests {
         );
         assert_eq!(serial.bounds, joined.bounds);
         assert_eq!(serial.diagnostics, joined.diagnostics);
+        // Some cuts fall in the middle of a layer. Selecting it must return
+        // every chord, including travel moves and their original color values.
+        for mode in [
+            crate::types::ColorMode::Speed,
+            crate::types::ColorMode::Flow,
+        ] {
+            let section = || PreviewPaths::new(mode);
+            let mut export = Builder::with_geometry(section());
+            assert_eq!(
+                parallel(&text, &State::default(), &mut export, &section),
+                Some(lines)
+            );
+            export.geometry.end_layer(export.z);
+            for layer in serial.geometry.iter() {
+                let range = layer.layer_index..layer.layer_index + 1;
+                let actual = export
+                    .geometry
+                    .chunks(range)
+                    .flat_map(|chunk| chunk.lines());
+                assert!(
+                    actual.eq(layer
+                        .segments
+                        .iter()
+                        .map(|s| crate::geometry::PreviewLine::from_segment(s, mode)))
+                );
+            }
+        }
     }
 
     #[test]

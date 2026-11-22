@@ -1,6 +1,7 @@
 //! Frame any layer range in groups of 64 visible strokes, as in the PNG export.
 //! Precomputed world bounds reject interior groups before we visit their strokes.
-use super::{BLOCK, Bounds, Projection, Role, ScreenBounds, Segment};
+use super::{BLOCK, Bounds, Projection, Role, ScreenBounds};
+use crate::types::Segment;
 use std::ops::Range;
 
 const GROUP: usize = BLOCK * BLOCK;
@@ -219,7 +220,15 @@ mod tests {
         let index = FramingIndex::new(&segments);
         for raw in [0..0, 0..1, 200..516, 517..600, 713..17113, 3671..18000] {
             for travel in [true, false] {
-                let cpu = Subject::from_segments(&segments[raw.clone()], travel);
+                let cpu = Subject::from_lines(
+                    &segments[raw.clone()].chunks(601).collect::<Vec<_>>(),
+                    |&chunk| {
+                        chunk.iter().map(|s| {
+                            crate::geometry::PreviewLine::from_segment(s, Default::default())
+                        })
+                    },
+                    travel,
+                );
                 let selected = index.select(&segments, raw.clone(), travel);
                 assert_eq!(selected.as_ref().map(Selection::bounds), cpu.bounds());
                 let Some(selected) = selected else { continue };

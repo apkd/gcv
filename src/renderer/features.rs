@@ -1,7 +1,7 @@
 //! Whole-print feature exports: project compact arcs and paint independent row bands.
 use super::{
-    Band, Frame, Legend, Projection, Raster, RenderError, RenderOptions, Role, ScreenPoint,
-    Subject, canvas, colors, corners, tangent_color,
+    Frame, Legend, Projection, Raster, RenderError, RenderOptions, Role, ScreenPoint, Subject,
+    canvas, colors, corners, tangent_color,
 };
 use crate::geometry::{FeaturePaths, Print, Stroke, StrokeBatch};
 use crate::types::Bounds;
@@ -29,7 +29,7 @@ pub(crate) fn render_features(
             });
         }
     } else {
-        draw_bands(&mut raster, &p, geom, tolerance, options.line_width);
+        draw_bands(&mut raster, &p, geom, tolerance, options.line_width)?;
     }
     if let Some(legend) = legend {
         legend.draw(&mut raster);
@@ -61,14 +61,14 @@ pub(super) fn arc_tolerance(p: &Projection, bounds: Bounds) -> f64 {
 // the depth test. Arc chord endpoints only exist here, so shade them now.
 #[derive(Clone, Copy)]
 enum Ink {
-    Straight(u32, crate::types::ExtrusionType),
+    Straight(u16, crate::types::ExtrusionType),
     Shaded([u8; 3]),
 }
 impl Ink {
     fn resolve(self, batch: &StrokeBatch) -> [u8; 3] {
         match self {
             Self::Straight(i, f) => {
-                let [a, b] = *batch.endpoints(i);
+                let [a, b] = batch.endpoints(i);
                 tangent_color(colors::feature_color(f), a, b)
             }
             Self::Shaded(rgb) => rgb,
@@ -85,7 +85,7 @@ fn project_strokes(
     let mut last = None;
     for stroke in strokes {
         let color = colors::feature_color(stroke.feature);
-        let [start, end] = *geom.endpoints(stroke.vertex);
+        let [start, end] = geom.endpoints(stroke.vertex);
         let mut prev = start;
         let mut screen = match last {
             Some((index, s)) if index == stroke.vertex => s,
@@ -123,8 +123,10 @@ fn project_strokes(
             let stride = ((max_angle / arc.sweep.abs()) * arc.steps as f64) as usize;
             let stride = stride.clamp(1, arc.steps);
             let limit = arc.steps - usize::from(corrected);
-            for i in (stride..limit).step_by(stride) {
+            let mut i = stride;
+            while i < limit {
                 line_to(arc.point(i as f64 / arc.steps as f64, start[2]));
+                i += stride;
             }
             if corrected {
                 line_to(arc.point(limit as f64 / arc.steps as f64, start[2]));
@@ -135,92 +137,29 @@ fn project_strokes(
     }
 }
 
-// Keep each projected line once. Neighboring moves usually visit the same
-// rows, so one bin entry covers a packet of lines. Workers own disjoint rows
-// and always see the original stroke order, including at equal depths.
 fn draw_bands(
     raster: &mut Raster,
     p: &Projection,
     geom: &FeaturePaths,
     tolerance: [f64; 2],
     width: f64,
-) {
-    use rayon::prelude::*;
-    const PACKET: usize = 32;
-    let w = raster.frame.width as usize;
-    let h = raster.frame.height as usize;
-    let rows = h.div_ceil(128).max(4);
-    let bins = h.div_ceil(rows);
-    let shift = rows.trailing_zeros();
-    let bin = |row: usize| {
-        if rows.is_power_of_two() {
-            row >> shift
-        } else {
-            row / rows
-        }
-    };
-    let radius = width * 0.5;
+) -> Result<(), RenderError> {
     let chunks: Vec<_> = geom.chunks().collect();
-    for part in chunks.chunks(32) {
-        let batches: Vec<_> = part
-            .par_iter()
-            .map(|&(geom, chunk)| {
-                let mut lines = Vec::with_capacity(chunk.len());
-                project_strokes(p, geom, chunk, tolerance, |pts, color| {
-                    lines.push((pts, color))
-                });
-                let packets = lines.len().div_ceil(PACKET);
-                let mut index = vec![0u32; packets * bins];
-                for (i, ([a, b], _)) in lines.iter().enumerate() {
-                    let lo = a.y.min(b.y);
-                    let hi = a.y.max(b.y);
-                    // Count rows by their pixel centers, as in Band::line.
-                    // Keep a rounding margin for clipping in band coordinates.
-                    let slack = 16. * f64::EPSILON * (lo.abs() + hi.abs() + h as f64);
-                    let first = bin((lo - radius - slack) as usize).min(bins);
-                    let end = bin(((hi + radius + 1. + slack) as usize).min(h) + rows - 1);
-                    if first < end {
-                        let packet = i / PACKET;
-                        let bit = 1 << (i % PACKET);
-                        for row in index[first * packets..end * packets].chunks_exact_mut(packets) {
-                            row[packet] |= bit;
-                        }
-                    }
-                }
-                (lines, index, geom)
-            })
-            .collect();
-        raster
-            .frame
-            .rgba
-            .par_chunks_mut(rows * w * 4)
-            .zip(raster.depth.par_chunks_mut(rows * w))
-            .enumerate()
-            .for_each(|(i, (rgba, depth))| {
-                let y = (i * rows) as f64;
-                let height = (depth.len() / w) as u32;
-                let mut band = Band {
-                    width: w as u32,
-                    height,
-                    rgba,
-                    depth,
-                };
-                for (lines, index, geom) in &batches {
-                    let n = lines.len().div_ceil(PACKET);
-                    for (packet, mut mask) in index[i * n..(i + 1) * n].iter().copied().enumerate()
-                    {
-                        while mask != 0 {
-                            let ([mut a, mut b], color) =
-                                lines[packet * PACKET + mask.trailing_zeros() as usize];
-                            mask &= mask - 1;
-                            a.y -= y;
-                            b.y -= y;
-                            band.line(a, b, || color.resolve(geom), width, 1., true);
-                        }
-                    }
-                }
-            });
-    }
+    super::bands::draw(
+        raster,
+        width,
+        &chunks,
+        |&(geom, chunk), lines| {
+            lines.reserve(chunk.len());
+            project_strokes(p, geom, chunk, tolerance, |pts, ink| lines.push((pts, ink)));
+            Ok(())
+        },
+        |band, y, ([mut a, mut b], ink), &(geom, _)| {
+            a.y -= f64::from(y);
+            b.y -= f64::from(y);
+            band.line(a, b, || ink.resolve(geom), width, 1., true);
+        },
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -381,6 +320,7 @@ mod tests {
                             [0.; 2],
                             options.line_width,
                         )
+                        .unwrap()
                     });
             }
             raster.frame.rgba

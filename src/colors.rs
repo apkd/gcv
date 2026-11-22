@@ -59,10 +59,14 @@ impl ColorRanges {
                 }
             }
         }
-        let defaults = [(0.0, 1.0), (0.0, 255.0), (0.0, 300.0), (0.0, 1.0)];
-        for (range, default) in ranges.iter_mut().zip(defaults) {
+        for (range, mode) in ranges.iter_mut().zip([
+            ColorMode::Speed,
+            ColorMode::Fan,
+            ColorMode::Temperature,
+            ColorMode::Flow,
+        ]) {
             if !range.0.is_finite() {
-                *range = default;
+                *range = default_range(mode);
             }
         }
         Self {
@@ -155,9 +159,12 @@ pub fn color_for_segment(segment: &Segment, mode: ColorMode, ranges: &ColorRange
     if mode == ColorMode::Feature {
         return feature_color(segment.extrusion_type);
     }
-    let (low, high) = ranges.range(mode);
+    value_color(mode, ranges.range(mode), segment_value(segment, mode))
+}
+
+pub(crate) fn value_color(mode: ColorMode, (low, high): (f64, f64), value: f64) -> [u8; 3] {
     let fraction = if high > low {
-        (segment_value(segment, mode) - low) / (high - low)
+        (value - low) / (high - low)
     } else {
         0.5
     };
@@ -183,14 +190,16 @@ pub fn legend_entries(
     mode: ColorMode,
     show_travel: bool,
 ) -> Vec<LegendEntry> {
-    if mode == ColorMode::Feature {
-        let mut counts = [0; 14];
-        for s in toolpath.segments().filter(|s| show_travel || !s.is_travel) {
-            counts[s.extrusion_type as usize] += 1;
-        }
-        return feature_legend(&counts);
-    }
-    scalar_legend(toolpath, mode)
+    preview_colors(
+        toolpath
+            .segments()
+            .map(|s| (s.extrusion_type, s.is_travel, segment_value(s, mode))),
+        toolpath.bounds,
+        mode,
+        true,
+        show_travel,
+    )
+    .1
 }
 
 pub(crate) fn feature_legend(counts: &[usize; 14]) -> Vec<LegendEntry> {
@@ -223,22 +232,69 @@ pub(crate) fn feature_legend(counts: &[usize; 14]) -> Vec<LegendEntry> {
         .collect()
 }
 
-fn scalar_legend(toolpath: &ToolpathData, mode: ColorMode) -> Vec<LegendEntry> {
-    let mut distinct = Vec::new();
-    let ranges = ColorRanges::collect(toolpath, |s| {
-        if !s.is_travel {
-            observe_value(&mut distinct, s, mode);
+pub(crate) fn preview_colors(
+    values: impl Iterator<Item = (ExtrusionType, bool, f64)>,
+    bounds: crate::types::Bounds,
+    mode: ColorMode,
+    legend: bool,
+    travel: bool,
+) -> ((f64, f64), Vec<LegendEntry>) {
+    if mode == ColorMode::Feature {
+        let mut counts = [0; 14];
+        if legend {
+            for (feature, is_travel, _) in values {
+                if travel || !is_travel {
+                    counts[feature as usize] += 1;
+                }
+            }
         }
-    });
-    scalar_entries(&ranges, mode, distinct)
+        return ((0., 1.), feature_legend(&counts));
+    }
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    let mut distinct = Vec::new();
+    for (_, is_travel, value) in values {
+        if !is_travel
+            && value.is_finite()
+            && (value > 0. || matches!(mode, ColorMode::Fan | ColorMode::Height))
+        {
+            low = low.min(value);
+            high = high.max(value);
+            if legend {
+                observe_value(&mut distinct, value, mode);
+            }
+        }
+    }
+    let range = if mode == ColorMode::Height {
+        (bounds.min[2], bounds.max[2])
+    } else if low.is_finite() {
+        (low, high)
+    } else {
+        default_range(mode)
+    };
+    (
+        range,
+        if legend {
+            scalar_entries(range, mode, distinct)
+        } else {
+            Vec::new()
+        },
+    )
+}
+
+fn default_range(mode: ColorMode) -> (f64, f64) {
+    match mode {
+        ColorMode::Fan => (0., 255.),
+        ColorMode::Temperature => (0., 300.),
+        _ => (0., 1.),
+    }
 }
 
 // Nine distinct display values are enough to switch to a continuous scale.
-fn observe_value(distinct: &mut Vec<f64>, segment: &Segment, mode: ColorMode) {
+fn observe_value(distinct: &mut Vec<f64>, raw: f64, mode: ColorMode) {
     if distinct.len() > 8 {
         return;
     }
-    let raw = segment_value(segment, mode);
     if !raw.is_finite() || (raw <= 0. && !matches!(mode, ColorMode::Fan | ColorMode::Height)) {
         return;
     }
@@ -265,7 +321,7 @@ impl Legends {
             if !s.is_travel {
                 visible[s.extrusion_type as usize] += 1;
                 for mode in ColorMode::ALL.into_iter().skip(1) {
-                    observe_value(&mut distinct[mode as usize], s, mode);
+                    observe_value(&mut distinct[mode as usize], segment_value(s, mode), mode);
                 }
             }
         });
@@ -274,7 +330,11 @@ impl Legends {
             if mode == ColorMode::Feature {
                 feature_legend(&visible)
             } else {
-                scalar_entries(&ranges, mode, std::mem::take(&mut distinct[mode as usize]))
+                scalar_entries(
+                    ranges.range(mode),
+                    mode,
+                    std::mem::take(&mut distinct[mode as usize]),
+                )
             }
         });
         (
@@ -308,11 +368,10 @@ fn hiding_travel_keeps_extrusions_with_a_travel_feature_tag() {
 }
 
 fn scalar_entries(
-    ranges: &ColorRanges,
+    (low, high): (f64, f64),
     mode: ColorMode,
     mut distinct: Vec<f64>,
 ) -> Vec<LegendEntry> {
-    let (low, high) = ranges.range(mode);
     let display_low = display_value(mode, low);
     let display_high = display_value(mode, high);
     let unit = match mode {

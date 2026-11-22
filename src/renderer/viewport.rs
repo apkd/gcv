@@ -307,7 +307,7 @@ impl Viewport {
             return Ok(self.target.as_ref().unwrap().id);
         }
         let data = &model.data;
-        let layers = o.layers(data);
+        let layers = o.layers(data.total_layers());
         let selection = model.scene.selection(data, layers.clone(), o.show_travel);
         let bed = [data.bed_x, data.bed_y];
         let p = Projection::framed(

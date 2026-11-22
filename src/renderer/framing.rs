@@ -1,8 +1,8 @@
 //! Fit the selected print in screen space, keeping the legend clear.
 use super::{Legend, Projection, RenderOptions, corners};
 use crate::{
-    geometry::{FeaturePaths, PlanarArc, Stroke, StrokeBatch},
-    types::{Bounds, ExtrusionType, Segment},
+    geometry::{FeaturePaths, PlanarArc, PreviewLine, Stroke, StrokeBatch},
+    types::{Bounds, ExtrusionType},
 };
 
 #[cfg(feature = "gui")]
@@ -40,10 +40,9 @@ pub(super) struct Subject {
 
 impl Subject {
     pub fn from_features(paths: &FeaturePaths) -> Self {
-        use rayon::prelude::*;
-        let include = |s: &mut Self, batch: &StrokeBatch, strokes: &[Stroke]| {
+        let include = |s: &mut Self, &(batch, strokes): &(&StrokeBatch, &[Stroke])| {
             for path in strokes {
-                let [start, end] = *batch.endpoints(path.vertex);
+                let [start, end] = batch.endpoints(path.vertex);
                 s.include(
                     Role::of(path.feature),
                     start,
@@ -53,41 +52,55 @@ impl Subject {
             }
         };
         let chunks: Vec<_> = paths.chunks().collect();
+        Self::from_chunks(&chunks, include, |(_, strokes)| {
+            let objects = strokes
+                .iter()
+                .filter(|s| Role::of(s.feature) == Role::Object)
+                .count();
+            [strokes.len() - objects, objects]
+        })
+    }
+
+    fn from_chunks<C: Sync>(
+        chunks: &[C],
+        include: impl Fn(&mut Self, &C) + Sync,
+        counts: impl Fn(&C) -> [usize; 2] + Sync,
+    ) -> Self {
+        use rayon::prelude::*;
         if chunks.len() < 4 {
             let mut subject = Self::default();
-            for (batch, strokes) in chunks {
-                include(&mut subject, batch, strokes);
+            for chunk in chunks {
+                include(&mut subject, chunk);
             }
             return subject;
         }
-        let role = ExtrusionType::ALL
-            .into_iter()
-            .filter(|&f| paths.counts[f as usize] > 0)
-            .map(Role::of)
-            .max()
-            .unwrap_or_default();
         // Count selected strokes so the same 64-stroke boxes are fitted at
         // every thread count and at every parser chunk boundary.
-        let mut offsets: Vec<_> = chunks
-            .par_iter()
-            .map(|(_, s)| s.iter().filter(|p| Role::of(p.feature) == role).count())
-            .collect();
+        let counts: Vec<_> = chunks.par_iter().map(&counts).collect();
+        let role = if counts.iter().any(|c| c[Role::Object as usize] != 0) {
+            Role::Object
+        } else {
+            Role::Auxiliary
+        };
         let mut count = 0;
-        for n in &mut offsets {
-            let start = count;
-            count += *n;
-            *n = start;
-        }
+        let offsets: Vec<_> = counts
+            .into_iter()
+            .map(|n| {
+                let start = count;
+                count += n[role as usize];
+                start
+            })
+            .collect();
         let parts: Vec<_> = chunks
             .par_iter()
             .zip(&offsets)
-            .map(|(&(batch, strokes), &offset)| {
+            .map(|(chunk, &offset)| {
                 let mut part = Self {
                     role,
                     count: offset,
                     blocks: Vec::new(),
                 };
-                include(&mut part, batch, strokes);
+                include(&mut part, chunk);
                 part.blocks
             })
             .collect();
@@ -110,19 +123,42 @@ impl Subject {
         }
     }
 
-    pub fn from_segments(segments: &[Segment], travel: bool) -> Self {
-        let mut subject = Self::default();
-        for s in segments {
-            if travel || !s.is_travel {
-                let role = if travel {
-                    Role::Object
-                } else {
-                    Role::of(s.extrusion_type)
-                };
-                subject.include(role, s.start, s.end, None);
+    pub fn from_lines<C: Sync, I: ExactSizeIterator<Item = PreviewLine>>(
+        chunks: &[C],
+        lines: impl Fn(&C) -> I + Sync,
+        travel: bool,
+    ) -> Self {
+        let role = |s: &PreviewLine| {
+            if travel {
+                Some(Role::Object)
+            } else if s.travel {
+                None
+            } else {
+                Some(Role::of(s.feature))
             }
-        }
-        subject
+        };
+        Self::from_chunks(
+            chunks,
+            |subject, chunk| {
+                for s in lines(chunk) {
+                    if let Some(r) = role(&s) {
+                        subject.include(r, s.start, s.end, None);
+                    }
+                }
+            },
+            |chunk| {
+                if travel {
+                    return [0, lines(chunk).len()];
+                }
+                let mut counts = [0; 2];
+                for s in lines(chunk) {
+                    if let Some(r) = role(&s) {
+                        counts[r as usize] += 1;
+                    }
+                }
+                counts
+            },
+        )
     }
 
     pub fn include(&mut self, role: Role, start: [f64; 3], end: [f64; 3], arc: Option<PlanarArc>) {
