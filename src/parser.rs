@@ -184,6 +184,7 @@ struct State {
     temp: f64,
     feature: ExtrusionType,
     motion: Option<u32>,
+    skipped_block_indent: Option<usize>,
     filament_area: f64,
     volumetric_e: bool,
 }
@@ -211,6 +212,7 @@ impl Default for State {
             temp: 0.0,
             feature: ExtrusionType::Unknown,
             motion: None,
+            skipped_block_indent: None,
             filament_area: PI * (1.75_f64 / 2.0).powi(2),
             volumetric_e: false,
         }
@@ -463,7 +465,11 @@ fn read_lines<G: Geometry>(
         {
             info.line(raw);
         }
-        if let Some(motion) = words.plain_motion(raw.as_bytes()) {
+        if let Some(indent) = state.skipped_block_indent {
+            if indentation(raw) > indent {
+                continue;
+            }
+        } else if let Some(motion) = words.plain_motion(raw.as_bytes()) {
             state.motion = Some(motion);
             make_move(state, builder, &words, motion, line)?;
             builder.group_has_lines = true;
@@ -488,12 +494,15 @@ fn read_lines<G: Geometry>(
             raw
         };
         let code = code.trim();
-        if code.is_empty() || code == "%" {
+        let statement = without_line_number(code);
+        if statement.is_empty() || statement == "%" || statement.starts_with('*') {
             builder.group_has_lines = true;
             continue;
         }
+        // Only an executable line can end an indented firmware block.
+        state.skipped_block_indent = None;
         // These firmware commands accept text or bare flags instead of motion words.
-        let first = first_command(code);
+        let first = first_command(statement);
         if matches!(
             first.and_then(|s| s.strip_prefix(['M', 'm'])),
             Some(
@@ -517,22 +526,35 @@ fn read_lines<G: Geometry>(
             builder.group_has_lines = true;
             continue;
         }
-        if code.starts_with(';') {
-            continue;
-        }
         if first.is_none()
-            && code
+            && statement
                 .as_bytes()
                 .first()
                 .is_some_and(|c| c.is_ascii_alphabetic())
         {
-            let token = code.split_whitespace().next().unwrap_or("");
+            let keyword = statement.split([' ', '\t', '{', '"', '(', '*']).next();
+            if matches!(keyword, Some("if" | "elif" | "else" | "while")) {
+                state.skipped_block_indent = Some(indentation(raw));
+                builder.warn(line, "conditional", "RepRapFirmware conditions are not evaluated. Conditional motion and state changes are omitted; subsequent positions may be approximate.");
+                builder.group_has_lines = true;
+                continue;
+            }
+            let token = statement.split_whitespace().next().unwrap_or("");
             if token.contains('_') || token.len() > 32 {
                 builder.warn(line, "macro", "Named firmware macros are not executed; any motion inside them is absent from this preview.");
                 builder.group_has_lines = true;
                 continue;
             }
         }
+        // Tool-change macros can take named arguments such as PURGE_LENGTH=0.
+        let code = match first {
+            Some(tool)
+                if tool.starts_with(['T', 't']) && named_argument(&statement[tool.len()..]) =>
+            {
+                tool
+            }
+            _ => code,
+        };
         lex(code, line, &mut words)?;
         let mut has_command = false;
         let mut explicit_motion = false;
@@ -1015,25 +1037,45 @@ fn split_comments(line: &str) -> (String, Vec<&str>) {
     (code, comments)
 }
 
-fn first_command(code: &str) -> Option<&str> {
-    let bytes = code.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i].to_ascii_uppercase();
-        if matches!(c, b'G' | b'M' | b'T') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
-                i += 1;
-            }
-            return Some(&code[start..i]);
+fn indentation(raw: &str) -> usize {
+    let mut column = 0;
+    for byte in raw.bytes() {
+        match byte {
+            b' ' => column += 1,
+            b'\t' => column = (column + 4) & !3, // RepRapFirmware uses four-column tab stops.
+            _ => break,
         }
-        if c != b'N' && !bytes[i].is_ascii_digit() && !bytes[i].is_ascii_whitespace() {
-            return None;
-        }
-        i += 1;
     }
-    None
+    column
+}
+
+fn without_line_number(code: &str) -> &str {
+    if let [b'N' | b'n', b'0'..=b'9', ..] = code.as_bytes() {
+        code[1..]
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start()
+    } else {
+        code
+    }
+}
+
+fn first_command(code: &str) -> Option<&str> {
+    if let [b'G' | b'g' | b'M' | b'm' | b'T' | b't', b'0'..=b'9', ..] = code.as_bytes() {
+        let end = code[1..].find(|c: char| !c.is_ascii_digit() && c != '.');
+        Some(&code[..end.map_or(code.len(), |n| n + 1)])
+    } else {
+        None
+    }
+}
+
+fn named_argument(args: &str) -> bool {
+    args.strip_prefix([' ', '\t'])
+        .and_then(|s| s.split_ascii_whitespace().next())
+        .and_then(|s| s.split_once('='))
+        .is_some_and(|(key, _)| {
+            key.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        })
 }
 
 fn lex(code: &str, line: usize, words: &mut Words) -> Result<(), ParseError> {
@@ -1041,6 +1083,7 @@ fn lex(code: &str, line: usize, words: &mut Words) -> Result<(), ParseError> {
     words.items.clear();
     words.present = 0;
     let mut i = 0;
+    let mut in_g29 = false;
     while i < bytes.len() {
         if bytes[i] == b'*' {
             break;
@@ -1092,6 +1135,10 @@ fn lex(code: &str, line: usize, words: &mut Words) -> Result<(), ParseError> {
             }
         }
         if digits == 0 {
+            // Prusa uses a bare G flag for bed heat soak, often written G29G.
+            if in_g29 && letter == b'G' && i == start {
+                continue;
+            }
             if matches!(letter, b'G' | b'M') {
                 return Err(error(
                     line,
@@ -1126,6 +1173,9 @@ fn lex(code: &str, line: usize, words: &mut Words) -> Result<(), ParseError> {
                     line,
                     format!("malformed numeric word {}", &code[start..]),
                 ));
+            }
+            if matches!(letter, b'G' | b'M') {
+                in_g29 = letter == b'G' && value == 29.0;
             }
             words.set(letter, Some(value));
             words.items.push(Word {

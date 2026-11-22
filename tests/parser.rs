@@ -340,6 +340,43 @@ fn firmware_arguments_are_not_motion_words() {
 }
 
 #[test]
+fn g29_probe_flags_leave_the_previous_motion_in_effect() {
+    let data = parse_gcode("G1 X8\nG29G\nN30 g29 X100 Y80 g*0\nX12").unwrap();
+    let segments: Vec<_> = data.segments().collect();
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[1].start, [8., 0., 0.]);
+    assert_eq!(segments[1].end, [12., 0., 0.]);
+    assert!(
+        data.diagnostics
+            .iter()
+            .any(|d| d.line == 2 && d.message.contains("G29"))
+    );
+    for bad in ["G1 X8 G", "G29 M104 G", "G29G-"] {
+        assert!(parse_gcode(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn conditional_branches_do_not_move_or_change_modal_state() {
+    let text = "G1 X8\nN20 if !move.axes[0].homed\n    G28\n\n; blank lines and comments do not end the branch\n\tG91\n\tif true\n\t\tG1 X100\nelif{state.currentTool == 0}\n  M83\nelse\n  G1 X200\nG1 X12 E2\nwhile iterations < 2\n  G1 X300\nX14 E3";
+    let data = parse_gcode(text).unwrap();
+    let base = parse_gcode("G1 X8\nG1 X12 E2\nX14 E3").unwrap();
+    assert!(data.segments().eq(base.segments()));
+    assert_eq!(data.diagnostics.len(), 1);
+    assert_eq!(data.diagnostics[0].line, 2);
+    assert!(data.diagnostics[0].message.contains("Conditional motion"));
+}
+
+#[test]
+fn tool_change_macro_arguments_do_not_become_motion_words() {
+    let data = parse_gcode("G1 X8\nN20 T4 PURGE_LENGTH=20 X=100\nX12").unwrap();
+    let base = parse_gcode("G1 X8\nT4\nX12").unwrap();
+    assert!(data.segments().eq(base.segments()));
+    assert_eq!(data.diagnostics, base.diagnostics);
+    assert!(parse_gcode("T4 G").is_err());
+}
+
+#[test]
 fn multiple_modal_commands_in_one_block() {
     let data = parse_gcode("G91 G1 X10 E1\nG1 X10 E2").unwrap();
     assert_eq!(data.segments().last().unwrap().end, [20.0, 0.0, 0.0]);

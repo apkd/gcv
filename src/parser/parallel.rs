@@ -368,6 +368,24 @@ mod tests {
     }
 
     #[test]
+    fn conditional_blocks_can_span_parser_sections() {
+        let mut text = String::from("M82\nG1 X1\n");
+        let padding = format!(";LAYER:0\n;{}\n", " ".repeat(48 * 1024));
+        text.push_str(&padding.repeat(8));
+        text.push_str("if move.axes[0].homed\n");
+        for _ in 0..24 {
+            text.push_str(&padding);
+            text.push_str("    G91\n    G1 X{var.target}\n");
+        }
+        text.push_str("G1 X2\n");
+        let mut joined = Builder::<LayerTable>::new();
+        assert!(parallel(&text, &State::default(), &mut joined, &LayerTable::default).is_some());
+        let expected = parse_gcode("G1 X1\nG1 X2").unwrap();
+        assert!(joined.geometry.segments().iter().eq(expected.segments()));
+        assert_eq!(joined.diagnostics.len(), 1);
+    }
+
+    #[test]
     fn late_errors_keep_serial_line_numbers_and_limits() {
         // The final arc has many planned chords but none long enough to draw.
         // Serial parsing still checks their budget before starting that arc.
