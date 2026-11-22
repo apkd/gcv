@@ -97,6 +97,23 @@ fn scientific_notation_preserves_uppercase_extrusion_word() {
 }
 
 #[test]
+fn multi_turn_helices_follow_the_circle_and_finish_at_the_commanded_point() {
+    for (motion, sign) in [("G2", -1.), ("G3", 1.)] {
+        let text = format!("M83\nG0 X12 Y4\n{motion} X12 Y4 Z8 I-10 J0 P9 E10");
+        let data = parse_gcode(&text).unwrap();
+        let chords = &data.layers.segments()[1..];
+        for (i, chord) in chords.iter().enumerate() {
+            let t = (i + 1) as f64 / chords.len() as f64;
+            let angle = sign * std::f64::consts::TAU * 9. * t;
+            near(chord.end[0], 2. + 10. * angle.cos());
+            near(chord.end[1], 4. + 10. * angle.sin());
+            near(chord.end[2], 8. * t);
+        }
+        assert_eq!(chords.last().unwrap().end, [12., 4., 8.]);
+    }
+}
+
+#[test]
 fn fan_temperature_feed_and_feature_persist() {
     let data=parse_gcode("; TYPE:External perimeter\nM104 S215\nM106 s127.5\nM83\nG1 X10 E1 F600\nG1 X20 E1\nM109 R205\nM107\n; TYPE:Perimeter\nG1 X30 E1\nM106\nG1 X40 E1").unwrap();
     let s: Vec<_> = data.segments().collect();
@@ -340,12 +357,17 @@ fn color_modes_round_trip() {
 #[test]
 fn plain_motion_and_numbered_blocks_agree() {
     let motion = [
+        "G1X1.25Y-.75E.2",
         "G1 X-.25 Y+3 F600",
         "G1 X.123456789012345 Y1. E.5",
         "G1 X2X3 E.2",
         "G1 X1e-3 E.31",
         "G1 Z.2",
         "G2 X1.001 Y1 I.5 J0 E.05",
+        "G1 X123.456 Y987.654 E.1",
+        "G1 X001.009 Y090.900Y2",
+        "G1 X012.345 Y678.90123",
+        "G1 X123.456 Z987.654",
     ];
     // Line numbers force the general lexer. Both forms have identical modal state.
     let input = |numbered: bool| {

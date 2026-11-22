@@ -75,6 +75,31 @@ const PLATES: &[(&str, &str)] = &[
 ];
 
 impl Collector {
+    pub fn scan(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        while start < bytes.len() {
+            // Comments and chamber commands are the only records we need,
+            // except when Cura identifies the starting tool after its header.
+            let hit = if self.awaiting_start_tool {
+                start
+            } else if let Some(n) = memchr::memchr2(b';', b'M', &bytes[start..]) {
+                let hit = start + n;
+                if let Some(i) = memchr::memrchr(b'\n', &bytes[start..hit]) {
+                    start += i + 1;
+                }
+                hit
+            } else {
+                break;
+            };
+            let end = memchr::memchr(b'\n', &bytes[hit..]).map_or(bytes.len(), |n| hit + n);
+            if end >= self.body_offset {
+                self.line(&text[start..end]);
+            }
+            start = end + 1;
+        }
+    }
+
     pub fn binary_field(&mut self, kind: u16, key: &str, value: &str) {
         let section = match kind {
             0 => Section::BinaryFile,

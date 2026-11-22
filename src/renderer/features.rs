@@ -3,7 +3,7 @@ use super::{
     Band, Frame, Legend, Projection, Raster, RenderError, RenderOptions, Role, ScreenPoint,
     Subject, canvas, colors, corners, tangent_color,
 };
-use crate::geometry::{FeaturePaths, Print, Stroke};
+use crate::geometry::{FeaturePaths, Print, Stroke, StrokeBatch};
 use crate::types::Bounds;
 
 pub(crate) fn render_features(
@@ -13,25 +13,21 @@ pub(crate) fn render_features(
 ) -> Result<Frame, RenderError> {
     options.validate()?;
     let geom = &print.geometry;
-    let mut subject = Subject::default();
-    for s in &geom.strokes {
-        subject.include(
-            Role::of(s.feature),
-            s.start,
-            s.end,
-            s.arc.map(|i| geom.arcs[i.get() as usize - 1]),
-        );
-    }
+    let subject = Subject::from_features(geom);
     let legend = Legend::new(options, info, || colors::feature_legend(&geom.counts));
     let (mut raster, p) = canvas(print.bed, options, &subject, legend.as_ref())?;
     let mut tolerance = [arc_tolerance(&p, print.bounds); 2];
     if let Some(bounds) = subject.bounds() {
         tolerance[subject.role as usize] = arc_tolerance(&p, bounds);
     }
-    if geom.strokes.len() < 16_384 {
-        project_strokes(&p, geom, &geom.strokes, tolerance, |[a, b], color| {
-            raster.line(a, b, color, options.line_width, 1., true)
-        });
+    if geom.batches.iter().map(|b| b.strokes.len()).sum::<usize>() < 16_384 {
+        for b in &geom.batches {
+            project_strokes(&p, b, &b.strokes, tolerance, |[a, end], ink| {
+                raster
+                    .band()
+                    .line(a, end, || ink.resolve(b), options.line_width, 1., true)
+            });
+        }
     } else {
         draw_bands(&mut raster, &p, geom, tolerance, options.line_width);
     }
@@ -61,24 +57,47 @@ pub(super) fn arc_tolerance(p: &Projection, bounds: Bounds) -> f64 {
     }
 }
 
+// A straight line can use its source stroke for shading once a pixel passes
+// the depth test. Arc chord endpoints only exist here, so shade them now.
+#[derive(Clone, Copy)]
+enum Ink {
+    Straight(u32, crate::types::ExtrusionType),
+    Shaded([u8; 3]),
+}
+impl Ink {
+    fn resolve(self, batch: &StrokeBatch) -> [u8; 3] {
+        match self {
+            Self::Straight(i, f) => {
+                let [a, b] = *batch.endpoints(i);
+                tangent_color(colors::feature_color(f), a, b)
+            }
+            Self::Shaded(rgb) => rgb,
+        }
+    }
+}
 fn project_strokes(
     p: &Projection,
-    geom: &FeaturePaths,
+    geom: &StrokeBatch,
     strokes: &[Stroke],
     tolerance: [f64; 2],
-    mut draw: impl FnMut([ScreenPoint; 2], [u8; 3]),
+    mut draw: impl FnMut([ScreenPoint; 2], Ink),
 ) {
     let mut last = None;
     for stroke in strokes {
         let color = colors::feature_color(stroke.feature);
-        let mut prev = stroke.start;
+        let [start, end] = *geom.endpoints(stroke.vertex);
+        let mut prev = start;
         let mut screen = match last {
-            Some((pt, s)) if pt == prev => s,
+            Some((index, s)) if index == stroke.vertex => s,
             _ => p.project(prev),
         };
         let mut line_to = |end| {
             let next = p.project(end);
-            let color = tangent_color(color, prev, end);
+            let color = if stroke.arc.is_some() {
+                Ink::Shaded(tangent_color(color, prev, end))
+            } else {
+                Ink::Straight(stroke.vertex, stroke.feature)
+            };
             if let (Some(a), Some(b)) = (screen, next) {
                 draw([a, b], color);
             } else if let Some(points) = p.project_line(prev, end) {
@@ -105,14 +124,14 @@ fn project_strokes(
             let stride = stride.clamp(1, arc.steps);
             let limit = arc.steps - usize::from(corrected);
             for i in (stride..limit).step_by(stride) {
-                line_to(arc.point(i as f64 / arc.steps as f64, stroke.start[2]));
+                line_to(arc.point(i as f64 / arc.steps as f64, start[2]));
             }
             if corrected {
-                line_to(arc.point(limit as f64 / arc.steps as f64, stroke.start[2]));
+                line_to(arc.point(limit as f64 / arc.steps as f64, start[2]));
             }
         }
-        line_to(stroke.end);
-        last = Some((stroke.end, screen));
+        line_to(end);
+        last = Some((stroke.vertex + 1, screen));
     }
 }
 
@@ -132,32 +151,43 @@ fn draw_bands(
     let h = raster.frame.height as usize;
     let rows = h.div_ceil(128).max(4);
     let bins = h.div_ceil(rows);
-    let margin = width * 0.5 + 1.;
-    for part in geom.strokes.chunks(131_072) {
+    let shift = rows.trailing_zeros();
+    let bin = |row: usize| {
+        if rows.is_power_of_two() {
+            row >> shift
+        } else {
+            row / rows
+        }
+    };
+    let radius = width * 0.5;
+    let chunks: Vec<_> = geom.chunks().collect();
+    for part in chunks.chunks(32) {
         let batches: Vec<_> = part
-            .par_chunks(4096)
-            .map(|chunk| {
+            .par_iter()
+            .map(|&(geom, chunk)| {
                 let mut lines = Vec::with_capacity(chunk.len());
                 project_strokes(p, geom, chunk, tolerance, |pts, color| {
                     lines.push((pts, color))
                 });
-                let mut index = vec![Vec::new(); bins];
-                for (i, packet) in lines.chunks(PACKET).enumerate() {
-                    let mut lo = f64::INFINITY;
-                    let mut hi = f64::NEG_INFINITY;
-                    for ([a, b], _) in packet {
-                        lo = lo.min(a.y.min(b.y));
-                        hi = hi.max(a.y.max(b.y));
-                    }
-                    let first = ((lo - margin) as usize / rows).min(bins);
-                    let end = (((hi + margin) as usize / rows) + 1).min(bins);
+                let packets = lines.len().div_ceil(PACKET);
+                let mut index = vec![0u32; packets * bins];
+                for (i, ([a, b], _)) in lines.iter().enumerate() {
+                    let lo = a.y.min(b.y);
+                    let hi = a.y.max(b.y);
+                    // Count rows by their pixel centers, as in Band::line.
+                    // Keep a rounding margin for clipping in band coordinates.
+                    let slack = 16. * f64::EPSILON * (lo.abs() + hi.abs() + h as f64);
+                    let first = bin((lo - radius - slack) as usize).min(bins);
+                    let end = bin(((hi + radius + 1. + slack) as usize).min(h) + rows - 1);
                     if first < end {
-                        for bin in &mut index[first..end] {
-                            bin.push(i);
+                        let packet = i / PACKET;
+                        let bit = 1 << (i % PACKET);
+                        for row in index[first * packets..end * packets].chunks_exact_mut(packets) {
+                            row[packet] |= bit;
                         }
                     }
                 }
-                (lines, index)
+                (lines, index, geom)
             })
             .collect();
         raster
@@ -175,20 +205,17 @@ fn draw_bands(
                     rgba,
                     depth,
                 };
-                for (lines, index) in &batches {
-                    for &packet in &index[i] {
-                        let start = packet * PACKET;
-                        for &([mut a, mut b], color) in
-                            &lines[start..(start + PACKET).min(lines.len())]
-                        {
-                            if a.y.min(b.y) > y + f64::from(height) + margin
-                                || a.y.max(b.y) < y - margin
-                            {
-                                continue;
-                            }
+                for (lines, index, geom) in &batches {
+                    let n = lines.len().div_ceil(PACKET);
+                    for (packet, mut mask) in index[i * n..(i + 1) * n].iter().copied().enumerate()
+                    {
+                        while mask != 0 {
+                            let ([mut a, mut b], color) =
+                                lines[packet * PACKET + mask.trailing_zeros() as usize];
+                            mask &= mask - 1;
                             a.y -= y;
                             b.y -= y;
-                            band.line(a, b, color, width, 1., true);
+                            band.line(a, b, || color.resolve(geom), width, 1., true);
                         }
                     }
                 }
@@ -327,10 +354,19 @@ mod tests {
             if threads == 0 {
                 project_strokes(
                     &p,
-                    &print.geometry,
-                    &print.geometry.strokes,
+                    &print.geometry.batches[0],
+                    &print.geometry.batches[0].strokes,
                     [0.; 2],
-                    |[a, b], c| raster.line(a, b, c, options.line_width, 1., true),
+                    |[a, b], c| {
+                        raster.line(
+                            a,
+                            b,
+                            c.resolve(&print.geometry.batches[0]),
+                            options.line_width,
+                            1.,
+                            true,
+                        )
+                    },
                 );
             } else {
                 rayon::ThreadPoolBuilder::new()

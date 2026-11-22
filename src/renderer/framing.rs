@@ -1,7 +1,7 @@
 //! Fit the selected print in screen space, keeping the legend clear.
 use super::{Legend, Projection, RenderOptions, corners};
 use crate::{
-    geometry::PlanarArc,
+    geometry::{FeaturePaths, PlanarArc, Stroke, StrokeBatch},
     types::{Bounds, ExtrusionType, Segment},
 };
 
@@ -39,6 +39,77 @@ pub(super) struct Subject {
 }
 
 impl Subject {
+    pub fn from_features(paths: &FeaturePaths) -> Self {
+        use rayon::prelude::*;
+        let include = |s: &mut Self, batch: &StrokeBatch, strokes: &[Stroke]| {
+            for path in strokes {
+                let [start, end] = *batch.endpoints(path.vertex);
+                s.include(
+                    Role::of(path.feature),
+                    start,
+                    end,
+                    path.arc.map(|i| batch.arcs[i.get() as usize - 1]),
+                );
+            }
+        };
+        let chunks: Vec<_> = paths.chunks().collect();
+        if chunks.len() < 4 {
+            let mut subject = Self::default();
+            for (batch, strokes) in chunks {
+                include(&mut subject, batch, strokes);
+            }
+            return subject;
+        }
+        let role = ExtrusionType::ALL
+            .into_iter()
+            .filter(|&f| paths.counts[f as usize] > 0)
+            .map(Role::of)
+            .max()
+            .unwrap_or_default();
+        // Count selected strokes so the same 64-stroke boxes are fitted at
+        // every thread count and at every parser chunk boundary.
+        let mut offsets: Vec<_> = chunks
+            .par_iter()
+            .map(|(_, s)| s.iter().filter(|p| Role::of(p.feature) == role).count())
+            .collect();
+        let mut count = 0;
+        for n in &mut offsets {
+            let start = count;
+            count += *n;
+            *n = start;
+        }
+        let parts: Vec<_> = chunks
+            .par_iter()
+            .zip(&offsets)
+            .map(|(&(batch, strokes), &offset)| {
+                let mut part = Self {
+                    role,
+                    count: offset,
+                    blocks: Vec::new(),
+                };
+                include(&mut part, batch, strokes);
+                part.blocks
+            })
+            .collect();
+        let mut blocks: Vec<Bounds> = Vec::with_capacity(count.div_ceil(BLOCK));
+        for (part, offset) in parts.into_iter().zip(offsets) {
+            let mut part = part.into_iter();
+            if !offset.is_multiple_of(BLOCK)
+                && let Some(head) = part.next()
+            {
+                let tail = blocks.last_mut().unwrap();
+                tail.include(head.min);
+                tail.include(head.max);
+            }
+            blocks.extend(part);
+        }
+        Self {
+            role,
+            count,
+            blocks,
+        }
+    }
+
     pub fn from_segments(segments: &[Segment], travel: bool) -> Self {
         let mut subject = Self::default();
         for s in segments {
@@ -63,7 +134,7 @@ impl Subject {
             self.count = 0;
             self.role = role;
         }
-        if self.count.is_multiple_of(BLOCK) {
+        if self.count.is_multiple_of(BLOCK) || self.blocks.is_empty() {
             self.blocks.push(Bounds {
                 min: start,
                 max: start,
@@ -240,6 +311,31 @@ impl ScreenBounds {
 mod tests {
     use super::*;
     use crate::colors;
+
+    #[test]
+    fn batch_boundaries_do_not_change_the_fit() {
+        let mut paths = FeaturePaths::default();
+        let mut serial = Subject::default();
+        for batch in 0..8 {
+            let mut strokes = StrokeBatch::default();
+            for i in 0..1901 {
+                let feature = if batch % 3 == 0 || i % 7 == 0 {
+                    ExtrusionType::SkirtBrim
+                } else {
+                    ExtrusionType::Perimeter
+                };
+                let x = f64::from(batch * 1901 + i);
+                let start = [x, x.sin() * 25., f64::from(batch)];
+                let end = [x + 1., (x + 1.).sin() * 25., start[2]];
+                paths.counts[feature as usize] += 1;
+                serial.include(Role::of(feature), start, end, None);
+                strokes.push(start, end, feature, None);
+            }
+            paths.batches.push(strokes);
+        }
+        let grouped = Subject::from_features(&paths);
+        assert_eq!(grouped.blocks, serial.blocks);
+    }
 
     #[test]
     fn both_parts_stay_inside_the_frame_and_clear_of_the_legend() {

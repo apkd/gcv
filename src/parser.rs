@@ -10,7 +10,6 @@ use crate::geometry::{FeaturePaths, Geometry, PlanarArc, Print};
 use crate::types::LayerTable;
 use crate::types::{Bounds, Diagnostic, ExtrusionType, Segment, ToolpathData};
 use std::{
-    collections::HashSet,
     error::Error,
     f64::consts::{PI, TAU},
     fmt,
@@ -21,6 +20,12 @@ const MAX_SEGMENTS: usize = 5_000_000;
 const MAX_LAYERS: usize = 1_000_000;
 const MAX_LINE_BYTES: usize = 1_048_576;
 const MAX_NUMBER: f64 = 1e12;
+
+mod parallel;
+
+fn supported_number(value: f64) -> bool {
+    value.abs() <= MAX_NUMBER
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParseError {
@@ -74,14 +79,19 @@ impl Words {
     // The common slicer form: one motion followed by plain decimal fields.
     // Exponents, bare selectors, comments, and mixed commands use the full lexer.
     fn plain_motion(&mut self, code: &[u8]) -> Option<u32> {
-        let [b'G', n @ b'0'..=b'3', b' ', rest @ ..] = code else {
+        let [b'G', n @ b'0'..=b'3', rest @ ..] = code else {
             return None;
         };
         if code.len() > 1024 {
             return None;
         }
-        let mut rest = rest;
+        let mut rest = rest.trim_ascii_start();
         self.present = 0;
+        if let Some(([x, y], tail)) = fixed_xy(rest) {
+            self.set(b'X', Some(x));
+            self.set(b'Y', Some(y));
+            rest = tail.trim_ascii_start();
+        }
         while !rest.is_empty() {
             let (&key, digits) = rest.split_first()?;
             if !matches!(
@@ -98,6 +108,35 @@ impl Words {
     }
 }
 
+// Slicers often emit both axes in this fixed-width form: X123.456 Y123.456.
+// Decode both fields together; other widths, signs and separators stay on the
+// ordinary decimal path. Keep division by 1000 to preserve decimal rounding.
+fn fixed_xy(bytes: &[u8]) -> Option<([f64; 2], &[u8])> {
+    let (pair, tail) = bytes.split_first_chunk::<17>()?;
+    if pair[8] != b' ' || tail.first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let x = u64::from_le_bytes(pair[..8].try_into().unwrap()) ^ u64::from_le_bytes(*b"X000.000");
+    let y = u64::from_le_bytes(pair[9..].try_into().unwrap()) ^ u64::from_le_bytes(*b"Y000.000");
+    if (x | y) & 0xf0f0_f0ff_f0f0_f0ff != 0 {
+        return None;
+    }
+    let six = 0x0606_0600_0606_0600;
+    if ((x + six) | (y + six)) & 0x1010_1000_1010_1000 != 0 {
+        return None;
+    }
+    // Each word now holds the eight byte values [0,a,b,c,0,d,e,f].
+    // Sum adjacent digits in 16-bit lanes, then triples in 32-bit lanes.
+    Some((
+        [x, y].map(|n| {
+            let pairs = (n * 10 + (n >> 8)) & 0x00ff_00ff_00ff_00ff;
+            let triples = (pairs * 100 + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+            f64::from((triples as u32) * 1000 + (triples >> 32) as u32) / 1000.
+        }),
+        tail,
+    ))
+}
+
 fn decimal(mut bytes: &[u8]) -> Option<(f64, &[u8])> {
     const POW10: [f64; 16] = [
         1., 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
@@ -107,9 +146,9 @@ fn decimal(mut bytes: &[u8]) -> Option<(f64, &[u8])> {
         bytes = &bytes[1..];
     }
     let mut i = 0;
-    let mut mantissa = 0u64;
+    let mut mantissa = 0i64;
     while i < bytes.len() && bytes[i].is_ascii_digit() && i < 15 {
-        mantissa = mantissa * 10 + u64::from(bytes[i] - b'0');
+        mantissa = mantissa * 10 + i64::from(bytes[i] - b'0');
         i += 1;
     }
     let mut fraction = 0;
@@ -118,7 +157,7 @@ fn decimal(mut bytes: &[u8]) -> Option<(f64, &[u8])> {
         i += 1;
         let start = i;
         while i < bytes.len() && bytes[i].is_ascii_digit() && i <= 15 {
-            mantissa = mantissa * 10 + u64::from(bytes[i] - b'0');
+            mantissa = mantissa * 10 + i64::from(bytes[i] - b'0');
             i += 1;
         }
         fraction = i - start;
@@ -131,6 +170,7 @@ fn decimal(mut bytes: &[u8]) -> Option<(f64, &[u8])> {
     (value <= MAX_NUMBER).then(|| (if negative { -value } else { value }, &bytes[i..]))
 }
 
+#[derive(Clone, PartialEq)]
 struct State {
     pos: [f64; 3],
     e: f64,
@@ -183,9 +223,10 @@ struct Builder<G> {
     index: usize,
     group_has_lines: bool,
     count: usize,
+    segment_limit: usize,
+    arc_budget_peak: usize,
     bounds: Option<Bounds>,
-    diagnostics: Vec<Diagnostic>,
-    warned: HashSet<String>,
+    diagnostics: Vec<(String, Diagnostic)>,
 }
 impl<G: Geometry> Builder<G> {
     fn new() -> Self {
@@ -195,18 +236,23 @@ impl<G: Geometry> Builder<G> {
             index: 0,
             group_has_lines: false,
             count: 0,
+            segment_limit: MAX_SEGMENTS,
+            arc_budget_peak: 0,
             bounds: None,
             diagnostics: vec![],
-            warned: HashSet::new(),
         }
     }
     fn warn(&mut self, line: usize, key: &str, message: impl Into<String>) {
-        if self.diagnostics.len() < 128 && !self.warned.contains(key) {
-            self.warned.insert(key.to_owned());
-            self.diagnostics.push(Diagnostic {
-                line,
-                message: message.into(),
-            });
+        if self.diagnostics.len() < MAX_DIAGNOSTICS
+            && !self.diagnostics.iter().any(|(k, _)| k == key)
+        {
+            self.diagnostics.push((
+                key.to_owned(),
+                Diagnostic {
+                    line,
+                    message: message.into(),
+                },
+            ));
         }
     }
     fn change_z(&mut self, z: f64, line: usize) -> Result<(), ParseError> {
@@ -241,14 +287,10 @@ impl<G: Geometry> Builder<G> {
         if distance2 <= EPS * EPS {
             return Ok(());
         }
-        if self.count >= MAX_SEGMENTS {
+        if self.count >= self.segment_limit {
             return Err(error(line, "segment limit exceeded (5,000,000)"));
         }
-        if start
-            .iter()
-            .chain(end.iter())
-            .any(|x| !x.is_finite() || x.abs() > MAX_NUMBER)
-        {
+        if !start.into_iter().chain(end).all(supported_number) {
             return Err(error(line, "coordinate exceeds supported finite range"));
         }
         let travel = e_delta <= EPS;
@@ -303,7 +345,7 @@ pub(crate) fn parse_detailed(
     text: &str,
     info: Option<&mut crate::print_info::Collector>,
 ) -> Result<ToolpathData, ParseError> {
-    let p = interpret::<LayerTable>(text, info)?;
+    let p = interpret::<LayerTable>(text, info, parallel::read)?;
     Ok(ToolpathData {
         layers: p.geometry,
         bounds: p.bounds,
@@ -318,30 +360,83 @@ pub(crate) fn parse_features(
     text: &str,
     info: Option<&mut crate::print_info::Collector>,
 ) -> Result<Print<FeaturePaths>, ParseError> {
-    interpret(text, info)
+    interpret(text, info, parallel::read)
 }
+
+const MAX_DIAGNOSTICS: usize = 128;
 
 fn interpret<G: Geometry>(
     text: &str,
-    mut info: Option<&mut crate::print_info::Collector>,
+    info: Option<&mut crate::print_info::Collector>,
+    read: impl FnOnce(
+        &str,
+        Option<&mut crate::print_info::Collector>,
+        &mut State,
+        &mut Builder<G>,
+    ) -> Result<usize, ParseError>
+    + Send,
 ) -> Result<Print<G>, ParseError> {
-    if text.as_bytes().contains(&0) {
+    if memchr::memchr(0, text.as_bytes()).is_some() {
         return Err(error(
             0,
             "NUL byte in text G-code (binary input must be decoded first)",
         ));
     }
-    let (bed_x, bed_y, max_z, diameter, bed_approximation) = metadata(text);
-    let mut state = State {
-        filament_area: PI * (diameter / 2.0).powi(2),
-        ..State::default()
-    };
-    let mut builder = Builder::<G>::new();
-    if bed_approximation {
-        builder.warn(0, "bed_shape", "A nonrectangular or offset bed_shape is represented by its rectangular width/height anchored at (0, 0).");
-    }
-    let mut words = Words::default();
     let text = text.trim_start_matches('\u{feff}');
+    let parse = |mut state| {
+        let mut builder = Builder::<G>::new();
+        read(text, info, &mut state, &mut builder)?;
+        Ok::<_, ParseError>(builder)
+    };
+    // Only flow depends on the filament diameter. A feature preview can
+    // interpret the moves while another worker reads footer settings.
+    let (settings, builder) = if !G::NEEDS_FLOW && text.len() >= 1024 * 1024 {
+        rayon::join(|| metadata(text), || parse(State::default()))
+    } else {
+        let settings @ (_, _, _, diameter, _) = metadata(text);
+        (
+            settings,
+            parse(State {
+                filament_area: PI * (diameter / 2.).powi(2),
+                ..State::default()
+            }),
+        )
+    };
+    let (bed_x, bed_y, max_z, _, bed_approximation) = settings;
+    let mut builder = builder?;
+    let bed_warning = bed_approximation.then(|| Diagnostic {
+        line:0,
+        message:"A nonrectangular or offset bed_shape is represented by its rectangular width/height anchored at (0, 0).".into()
+    });
+    if builder.group_has_lines {
+        builder.geometry.end_layer(builder.z);
+    }
+    Ok(Print {
+        geometry: builder.geometry,
+        segments: builder.count,
+        layers: builder.index + usize::from(builder.group_has_lines),
+        bed: [bed_x, bed_y],
+        max_z,
+        bounds: builder.bounds.unwrap_or(Bounds {
+            min: [0.0; 3],
+            max: [bed_x, bed_y, max_z],
+        }),
+        diagnostics: bed_warning
+            .into_iter()
+            .chain(builder.diagnostics.into_iter().map(|(_, d)| d))
+            .take(MAX_DIAGNOSTICS)
+            .collect(),
+    })
+}
+
+fn read_lines<G: Geometry>(
+    text: &str,
+    mut info: Option<&mut crate::print_info::Collector>,
+    state: &mut State,
+    builder: &mut Builder<G>,
+) -> Result<usize, ParseError> {
+    let mut words = Words::default();
+    let mut lines = 0;
     let mut start = 0;
     let ends = memchr::memchr_iter(b'\n', text.as_bytes())
         .chain((!text.is_empty() && !text.ends_with('\n')).then_some(text.len()));
@@ -350,6 +445,7 @@ fn interpret<G: Geometry>(
         let raw = raw.strip_suffix('\r').unwrap_or(raw);
         start = end + 1;
         let line = index + 1;
+        lines = line;
         if raw.len() > MAX_LINE_BYTES {
             return Err(error(line, "line exceeds 1 MiB limit"));
         }
@@ -360,7 +456,7 @@ fn interpret<G: Geometry>(
         }
         if let Some(motion) = words.plain_motion(raw.as_bytes()) {
             state.motion = Some(motion);
-            make_move(&mut state, &mut builder, &words, motion, line)?;
+            make_move(state, builder, &words, motion, line)?;
             builder.group_has_lines = true;
             continue;
         }
@@ -547,7 +643,7 @@ fn interpret<G: Geometry>(
                     "Rotary axes A/B/C are ignored; only XYZ geometry is visualized.",
                 );
             }
-            make_move(&mut state, &mut builder, &words, motion, line)?;
+            make_move(state, builder, &words, motion, line)?;
         } else if !has_command && words.items.iter().all(|w| matches!(w.letter, b'F' | b'N')) {
             if let Some(feed) = words.get(b'F') {
                 state.feed = valid_feed(feed * state.unit, line)?;
@@ -561,25 +657,11 @@ fn interpret<G: Geometry>(
         }
         builder.group_has_lines = true;
     }
-    if builder.group_has_lines {
-        builder.geometry.end_layer(builder.z);
-    }
-    Ok(Print {
-        geometry: builder.geometry,
-        segments: builder.count,
-        layers: builder.index + usize::from(builder.group_has_lines),
-        bed: [bed_x, bed_y],
-        max_z,
-        bounds: builder.bounds.unwrap_or(Bounds {
-            min: [0.0; 3],
-            max: [bed_x, bed_y, max_z],
-        }),
-        diagnostics: builder.diagnostics,
-    })
+    Ok(lines)
 }
 
 fn valid_feed(value: f64, line: usize) -> Result<f64, ParseError> {
-    if value < 0.0 || !value.is_finite() || value > MAX_NUMBER {
+    if !(0.0..=MAX_NUMBER).contains(&value) {
         Err(error(line, "feed rate must be a finite nonnegative number"))
     } else {
         Ok(value)
@@ -612,14 +694,14 @@ fn make_move<G: Geometry>(
             end[i] = value * state.unit + if state.absolute { 0.0 } else { start[i] };
         }
     }
-    if end.iter().any(|v| !v.is_finite() || v.abs() > MAX_NUMBER) {
+    if !end.into_iter().all(supported_number) {
         return Err(error(line, "coordinate exceeds supported finite range"));
     }
     let next_e = words
         .get(b'E')
         .map(|value| value * state.extrusion_scale() + if state.absolute_e { 0.0 } else { state.e })
         .unwrap_or(state.e);
-    if !next_e.is_finite() || next_e.abs() > MAX_NUMBER {
+    if !supported_number(next_e) {
         return Err(error(line, "extrusion exceeds supported finite range"));
     }
     let e_delta = next_e - state.e;
@@ -709,9 +791,9 @@ fn linearize_arc<G: Geometry>(
     let a0 = (start[v] - center[1]).atan2(start[u] - center[0]);
     let a1 = (end[v] - center[1]).atan2(end[u] - center[0]);
     let mut sweep = if clockwise {
-        -(a0 - a1).rem_euclid(TAU)
+        -PlanarArc::phase(a0 - a1)
     } else {
-        (a1 - a0).rem_euclid(TAU)
+        PlanarArc::phase(a1 - a0)
     };
     if sweep.abs() <= EPS {
         sweep = if clockwise { -TAU } else { TAU };
@@ -726,10 +808,15 @@ fn linearize_arc<G: Geometry>(
         out.warn(line, "arc_p", "Arc P uses a total-turn count (P1 = ordinary arc, P2 = one extra revolution); firmware dialects that count additional circles differ.");
         sweep += if clockwise { -TAU } else { TAU } * (turns - 1.0);
     }
-    let length = (sweep.abs() * radius).hypot(end[w] - start[w]);
+    let planar_length = sweep.abs() * radius;
+    let length = if end[w] == start[w] {
+        planar_length
+    } else {
+        planar_length.hypot(end[w] - start[w])
+    };
     let steps_f = (length / 0.2)
+        .max(sweep.abs() / 5_f64.to_radians())
         .ceil()
-        .max((sweep.abs() / 5_f64.to_radians()).ceil())
         .max(1.0);
     if !steps_f.is_finite() || steps_f > (MAX_SEGMENTS - out.count) as f64 {
         return Err(error(
@@ -738,7 +825,11 @@ fn linearize_arc<G: Geometry>(
         ));
     }
     let steps = steps_f as usize;
-    if steps > 1 && w == 2 && end[2] == start[2] {
+    // Arc admission reserves all canonical chords, including any that later
+    // turn out to have zero length. Preserve that check when joining sections.
+    out.arc_budget_peak = out.arc_budget_peak.max(out.count + steps);
+    let mut rotation = None;
+    if steps > 1 && w == 2 {
         let arc = PlanarArc {
             center,
             radius,
@@ -751,12 +842,19 @@ fn linearize_arc<G: Geometry>(
         // distance. Degenerate or extreme-coordinate arcs use the exact loop.
         let extent = center[0].abs().max(center[1].abs()) + radius;
         let min_chord = radius.min(end_radius) * (sweep.abs() / steps_f) * 0.9;
-        if extent <= MAX_NUMBER
+        if end[2] == start[2]
+            && extent <= MAX_NUMBER
             && min_chord > EPS + extent * f64::EPSILON * 8.0
             && out
                 .geometry
                 .store_arc(arc, start, end, state.feature, e_delta / steps_f <= EPS)
         {
+            if out.count >= out.segment_limit {
+                return Err(error(line, "segment limit exceeded (5,000,000)"));
+            }
+            // A retained arc takes one worker budget slot, regardless of its
+            // logical chord count. The file-wide segment limit still applies.
+            out.segment_limit = (out.segment_limit + steps - 1).min(MAX_SEGMENTS);
             let bounds = out.bounds.get_or_insert(Bounds {
                 min: start,
                 max: start,
@@ -768,18 +866,35 @@ fn linearize_arc<G: Geometry>(
             out.group_has_lines = true;
             return Ok(());
         }
+        // Rotate short runs of radii in the XY plane. Direct angle evaluation
+        // every 32 chords bounds drift. Keep the original calculation when
+        // coordinate rounding could change whether a chord counts as a move.
+        if steps >= 4 && extent * (128. * f64::EPSILON) < EPS && min_chord > 4. * EPS {
+            rotation = Some((sweep / steps_f).sin_cos());
+        }
     }
     let mut previous = start;
+    let mut radial = [start[u] - center[0], start[v] - center[1]];
     for index in 1..=steps {
         let t = index as f64 / steps as f64;
-        let angle = a0 + sweep * t;
-        let mut point = start;
-        point[u] = center[0] + radius * angle.cos();
-        point[v] = center[1] + radius * angle.sin();
-        point[w] = start[w] + (end[w] - start[w]) * t;
-        if index == steps {
-            point = end;
-        }
+        let point = if index == steps {
+            end
+        } else {
+            radial = match rotation {
+                Some((s, c)) if index % 32 != 0 => {
+                    [radial[0] * c - radial[1] * s, radial[0] * s + radial[1] * c]
+                }
+                _ => {
+                    let (s, c) = (a0 + sweep * t).sin_cos();
+                    [radius * c, radius * s]
+                }
+            };
+            let mut point = start;
+            point[u] = center[0] + radial[0];
+            point[v] = center[1] + radial[1];
+            point[w] = start[w] + (end[w] - start[w]) * t;
+            point
+        };
         // Match the original's linearize-before-layer-grouping order. Helical
         // arcs therefore create a Z group for every tessellated Z change.
         if (point[2] - previous[2]).abs() > EPS {
@@ -795,32 +910,63 @@ fn linearize_arc<G: Geometry>(
 /// Recognizes PrusaSlicer names and common Cura/Orca equivalents.
 pub fn parse_type_comment(comment: &str) -> Option<ExtrusionType> {
     let comment = comment.trim().trim_start_matches(';').trim();
-    let (_, value) = comment.split_once(':')?;
-    let key = comment.split_once(':')?.0.trim();
+    let (key, value) = comment.split_once(':')?;
+    let key = key.trim();
     if !key.eq_ignore_ascii_case("TYPE") && !key.eq_ignore_ascii_case("FEATURE") {
         return None;
     }
-    Some(match value.trim().to_ascii_lowercase().as_str() {
-        "external perimeter" | "overhang perimeter" | "wall-outer" | "outer wall"
-        | "overhang wall" => ExtrusionType::ExternalPerimeter,
-        "perimeter" | "wall-inner" | "inner wall" => ExtrusionType::Perimeter,
-        "infill" | "fill" | "sparse infill" => ExtrusionType::Infill,
-        "solid infill" | "internal solid infill" | "skin" => ExtrusionType::SolidInfill,
-        "top solid infill" | "top surface" => ExtrusionType::TopSolidInfill,
-        "bridge infill" | "bridge" | "internal bridge" => ExtrusionType::BridgeInfill,
-        "support material"
-        | "support material interface"
-        | "support"
-        | "support-interface"
-        | "support interface" => ExtrusionType::SupportMaterial,
-        "skirt/brim" | "skirt" | "brim" => ExtrusionType::SkirtBrim,
-        "custom" => ExtrusionType::Custom,
-        "gap fill" => ExtrusionType::GapFill,
-        "ironing" => ExtrusionType::Ironing,
-        "wipe tower" | "prime-tower" | "prime tower" => ExtrusionType::Wipe,
-        "travel" => ExtrusionType::Travel,
-        _ => ExtrusionType::Unknown,
-    })
+    use ExtrusionType::*;
+    const NAMES: &[(&[&str], ExtrusionType)] = &[
+        (
+            &[
+                "external perimeter",
+                "overhang perimeter",
+                "wall-outer",
+                "outer wall",
+                "overhang wall",
+            ],
+            ExternalPerimeter,
+        ),
+        (&["perimeter", "wall-inner", "inner wall"], Perimeter),
+        (&["infill", "fill", "sparse infill"], Infill),
+        (
+            &["solid infill", "internal solid infill", "skin"],
+            SolidInfill,
+        ),
+        (&["top solid infill", "top surface"], TopSolidInfill),
+        (
+            &["bridge infill", "bridge", "internal bridge"],
+            BridgeInfill,
+        ),
+        (
+            &[
+                "support material",
+                "support material interface",
+                "support",
+                "support-interface",
+                "support interface",
+            ],
+            SupportMaterial,
+        ),
+        (&["skirt/brim", "skirt", "brim"], SkirtBrim),
+        (&["custom"], Custom),
+        (&["gap fill"], GapFill),
+        (&["ironing"], Ironing),
+        (&["wipe tower", "prime-tower", "prime tower"], Wipe),
+        (&["travel"], Travel),
+    ];
+    let value = value.trim();
+    Some(
+        NAMES
+            .iter()
+            .find_map(|(names, feature)| {
+                names
+                    .iter()
+                    .any(|s| value.eq_ignore_ascii_case(s))
+                    .then_some(*feature)
+            })
+            .unwrap_or(Unknown),
+    )
 }
 
 fn split_comments(line: &str) -> (String, Vec<&str>) {
@@ -963,7 +1109,7 @@ fn lex(code: &str, line: usize, words: &mut Words) -> Result<(), ParseError> {
             let value: f64 = code[start..i]
                 .parse()
                 .map_err(|_| error(line, "invalid numeric word"))?;
-            if !value.is_finite() || value.abs() > MAX_NUMBER {
+            if !supported_number(value) {
                 return Err(error(line, "numeric word exceeds supported finite range"));
             }
             if bytes.get(i) == Some(&b'.') {
@@ -1001,7 +1147,7 @@ fn metadata(text: &str) -> (f64, f64, f64, f64, bool) {
     let mut bed_approximation = false;
     // Metadata lines either contain an assignment or an M862.3 command.
     // Skip runs of numeric motion records with the vectorized byte search.
-    let mut remaining = text.trim_start_matches('\u{feff}');
+    let mut remaining = text;
     while let Some(hit) = memchr::memchr3(b'=', b'M', b'm', remaining.as_bytes()) {
         let start = memchr::memrchr(b'\n', &remaining.as_bytes()[..hit]).map_or(0, |i| i + 1);
         let end = memchr::memchr(b'\n', &remaining.as_bytes()[hit..])

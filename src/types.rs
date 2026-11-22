@@ -195,6 +195,16 @@ impl LayerTable {
     pub(crate) fn finish(&mut self, z: f64) {
         self.ends.push((z, self.segments.len()));
     }
+    pub(crate) fn append(&mut self, part: Self) {
+        let layers = self.ends.len();
+        let segments = self.segments.len();
+        self.ends
+            .extend(part.ends.into_iter().map(|(z, end)| (z, end + segments)));
+        self.segments.extend(part.segments.into_iter().map(|mut s| {
+            s.layer_index += layers;
+            s
+        }));
+    }
 }
 
 impl<I: IntoIterator<Item = Segment>> FromIterator<(f64, I)> for LayerTable {

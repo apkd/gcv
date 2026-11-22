@@ -349,11 +349,12 @@ impl Band<'_> {
         &mut self,
         a: ScreenPoint,
         b: ScreenPoint,
-        color: [u8; 3],
+        mut resolve: impl FnMut() -> [u8; 3],
         width: f64,
         opacity: f64,
         write_depth: bool,
     ) {
+        let mut color = None;
         let radius = width * 0.5;
         let Some([a, b]) = clip_line(
             a,
@@ -367,57 +368,47 @@ impl Band<'_> {
         let dx = b.x - a.x;
         let dy = b.y - a.y;
         let length_squared = dx * dx + dy * dy;
-        // Iterate only a thin strip along the major axis, rather than the full
-        // bounding rectangle of a diagonal line. Runtime is O(visible length).
-        let steep = dy.abs() > dx.abs();
-        let (major_a, major_b, minor_a, minor_b) = if steep {
-            (a.y, b.y, a.x, b.x)
-        } else {
-            (a.x, b.x, a.y, b.y)
-        };
-        let major_delta = major_b - major_a;
-        let minor_delta = minor_b - minor_a;
-        let (major_limit, minor_limit) = if steep {
-            (self.height, self.width)
-        } else {
-            (self.width, self.height)
-        };
-        let outer = radius + 0.5;
-        // Pixel centers exactly on the outer edge have zero coverage.
-        let start = ((major_a.min(major_b) - outer + 0.5) as i32).max(0);
-        let end = ((major_a.max(major_b) + outer + 0.5) as i32).min(major_limit as i32);
         let inv_length = if length_squared > 1e-20 {
             1.0 / length_squared
         } else {
             0.0
         };
-        let inv_major = if major_delta.abs() > 1e-12 {
-            1.0 / major_delta
-        } else {
-            0.0
-        };
-        // Distance to a diagonal line is smaller than distance in the minor
-        // coordinate, so widen the strip by sqrt(2) at a 45-degree slope.
-        let strip_radius = outer * (1.0 + (minor_delta * inv_major).powi(2)).sqrt();
-        for major in start..end {
-            let fraction = ((f64::from(major) + 0.5 - major_a) * inv_major).clamp(0.0, 1.0);
-            let minor_center = minor_a + fraction * minor_delta;
-            for minor in ((minor_center - strip_radius + 0.5) as i32).max(0)
-                ..((minor_center + strip_radius + 0.5) as i32).min(minor_limit as i32)
-            {
-                let (x, y) = if steep {
-                    (minor, major)
-                } else {
-                    (major, minor)
-                };
-                let px = f64::from(x) + 0.5;
-                let py = f64::from(y) + 0.5;
-                let t = (((px - a.x) * dx + (py - a.y) * dy) * inv_length).clamp(0.0, 1.0);
-                let distance2 = (px - a.x - t * dx).powi(2) + (py - a.y - t * dy).powi(2);
+        let outer = radius + 0.5;
+        let w = self.width;
+        let h = self.height;
+        // Use the same rounded depth interpolation as the pixel test at t=1.
+        // A stroke behind this pixel at both ends cannot contribute.
+        let max_metric = a.metric.max(a.metric + (b.metric - a.metric)) as f32;
+        let left = ((a.x.min(b.x) - outer + 0.5) as i32).max(0);
+        let right = ((a.x.max(b.x) + outer + 0.5) as i32).min(w as i32);
+        let rows = ((a.y.min(b.y) - outer + 0.5) as i32).max(0)
+            ..((a.y.max(b.y) + outer + 0.5) as i32).min(h as i32);
+        // The capsule lies inside both its endpoint box and the strip around
+        // its infinite center line. Short moves need only the box.
+        let narrow = dy.abs() > 2.0 && dx.abs() > 2.0;
+        let slope = if narrow { dx / dy } else { 0.0 };
+        let extent = outer * (1.0 + slope * slope).sqrt();
+        for y in rows {
+            let py = f64::from(y) + 0.5 - a.y;
+            let xs = if narrow {
+                let center = a.x + py * slope;
+                let slack = 8. * f64::EPSILON * (a.x.abs() + (py * slope).abs() + extent);
+                left.max((center - extent - slack + 0.5) as i32)
+                    ..right.min((center + extent + slack + 0.5) as i32)
+            } else {
+                left..right
+            };
+            for x in xs {
+                let pixel = y as usize * w as usize + x as usize;
+                if max_metric < self.depth[pixel] {
+                    continue;
+                }
+                let px = f64::from(x) + 0.5 - a.x;
+                let t = ((px * dx + py * dy) * inv_length).clamp(0.0, 1.0);
+                let distance2 = (px - t * dx).powi(2) + (py - t * dy).powi(2);
                 if distance2 >= outer * outer {
                     continue;
                 }
-                let pixel = y as usize * self.width as usize + x as usize;
                 let metric = (a.metric + t * (b.metric - a.metric)) as f32;
                 if metric < self.depth[pixel] {
                     continue;
@@ -425,7 +416,11 @@ impl Band<'_> {
                 if write_depth {
                     self.depth[pixel] = metric;
                 }
-                self.blend(pixel, color, opacity * (outer - distance2.sqrt()).min(1.0));
+                self.blend(
+                    pixel,
+                    *color.get_or_insert_with(&mut resolve),
+                    opacity * (outer - distance2.sqrt()).min(1.0),
+                );
             }
         }
     }
@@ -447,7 +442,8 @@ impl Raster {
         opacity: f64,
         write_depth: bool,
     ) {
-        self.band().line(a, b, color, width, opacity, write_depth);
+        self.band()
+            .line(a, b, || color, width, opacity, write_depth);
     }
     fn world_line(
         &mut self,
@@ -939,6 +935,44 @@ fn glyph(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanlines_cover_the_caps_and_sides_of_a_stroke() {
+        let a = ScreenPoint {
+            x: 3.25,
+            y: 2.75,
+            metric: 1.,
+        };
+        for (x, y) in [
+            (3.25, 2.75),
+            (31.5, 3.),
+            (32., 5.1),
+            (7., 26.8),
+            (1., 38.),
+            (30., 31.),
+        ] {
+            let b = ScreenPoint { x, y, ..a };
+            let mut raster = Raster::new(34, 40).unwrap();
+            raster.line(a, b, [255; 3], 2.3, 1., true);
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let length = dx.hypot(dy);
+            for (i, depth) in raster.depth.iter().enumerate() {
+                let px = (i % 34) as f64 + 0.5 - a.x;
+                let py = (i / 34) as f64 + 0.5 - a.y;
+                // Independent distance to the start cap, end cap, or side.
+                let along = px * dx + py * dy;
+                let distance = if along <= 0. {
+                    px.hypot(py)
+                } else if along >= length * length {
+                    (px - dx).hypot(py - dy)
+                } else {
+                    (px * dy - py * dx).abs() / length
+                };
+                assert_eq!(depth.is_finite(), distance < 2.3 / 2. + 0.5);
+            }
+        }
+    }
 
     #[test]
     fn filament_shading_depends_on_orientation_but_not_print_direction() {

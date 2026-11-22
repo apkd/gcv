@@ -5,7 +5,11 @@ fn read(text: &str) -> PrintInfo {
     for line in text.lines() {
         c.line(line);
     }
-    c.finish()
+    let mut scanned = Collector::default();
+    scanned.scan(text);
+    let info = c.finish();
+    assert_eq!(scanned.finish(), info);
+    info
 }
 
 #[test]
