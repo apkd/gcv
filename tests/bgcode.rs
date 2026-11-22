@@ -271,6 +271,26 @@ fn heatshrink_rejects_trailing_tokens_nonzero_padding_and_truncation() {
 }
 
 #[test]
+fn heatshrink_matches_can_cross_the_start_of_output_at_any_bit_alignment() {
+    for (mode, width) in [(2, 11), (3, 12)] {
+        for literals in 1..=8 {
+            let mut tokens = vec![(0x141, 9); literals]; // literal A
+            // Read two zeroes before the literal prefix, then repeat that pattern.
+            tokens.extend([(literals + 1, width + 1), (15, 4)]);
+            let pattern = [vec![0; 2], vec![b'A'; literals]].concat();
+            let mut expected = vec![b'A'; literals];
+            expected.extend(pattern.iter().copied().cycle().take(16));
+            let packed = bits(&tokens);
+            let text = decode_bgcode(&file(mode, 0, expected.len(), &packed)).unwrap();
+            assert_eq!(text.as_bytes(), expected);
+            assert!(
+                decode_bgcode(&file(mode, 0, expected.len(), &packed[..packed.len() - 1])).is_err()
+            );
+        }
+    }
+}
+
+#[test]
 fn meatpack_escapes_nibble_order_and_end_of_line_padding() {
     let packed = [
         255, 255, 251, 0x1d, 0xfe, b'Y', 0x6f, b'A', 0xff, b'B', b'C', 0x0c,
@@ -319,9 +339,10 @@ fn metadata_is_commented_and_cannot_execute_commands() {
     let mut bytes = header(1, true);
     let metadata = b"bed_x=250\nG92 X999\n";
     bytes.extend(block(2, 0, metadata.len(), &[0, 0], metadata, true));
+    bytes.extend(block(1, 0, 1, &[0, 0], b"G", true));
     let json = br#"{"printer":{"bed_shape":"0x0,250x0,250x210,0x210","max_print_height":220},"note":"test\nG92 E999"}"#;
     bytes.extend(block(3, 0, json.len(), &[1, 0], json, true));
-    bytes.extend(block(1, 0, 3, &[0, 0], b"G1\n", true));
+    bytes.extend(block(1, 0, 2, &[0, 0], b"1\n", true));
     let text = decode_bgcode(&bytes).unwrap();
     assert!(text.contains("; bed_shape = 0x0,250x0,250x210,0x210\n"));
     assert!(text.contains("; G92 X999\n"));
@@ -350,6 +371,77 @@ fn thumbnail_content_is_validated_and_not_emitted() {
     assert_eq!(decode_bgcode(&bytes).unwrap(), "G1\n");
     bytes[30] ^= 1;
     assert!(decode_bgcode(&bytes).unwrap_err().message.contains("CRC32"));
+}
+
+#[test]
+fn parallel_binary_blocks_preserve_text_and_report_the_first_error() {
+    let mut bytes = header(1, false);
+    let thumbnail = vec![0; 512 * 1024];
+    bytes.extend(block(
+        5,
+        0,
+        thumbnail.len(),
+        &[0, 0, 16, 0, 16, 0],
+        &thumbnail,
+        false,
+    ));
+    let append = |dst: &mut Vec<u8>, kind, raw: &[u8]| {
+        dst.extend(block(kind, 1, raw.len(), &[0, 0], &zlib(raw), false))
+    };
+    append(&mut bytes, 1, b"G1 X1");
+    append(&mut bytes, 2, b"printer=sample\n");
+    append(&mut bytes, 1, b"0\n");
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    assert_eq!(
+        pool.install(|| decode_bgcode(&bytes)).unwrap(),
+        "; printer=sample\nG1 X10\n"
+    );
+
+    let offset = bytes.len();
+    append(&mut bytes, 1, &[255]); // Valid compression, invalid G-code text.
+    bytes.extend(block(1, 2, 4, &[0, 0], &[], false)); // Invalid compression.
+    bytes.push(255); // Incomplete header.
+    let error = pool.install(|| decode_bgcode(&bytes)).unwrap_err();
+    assert_eq!(error.offset, offset);
+    assert!(error.message.contains("UTF-8"));
+}
+
+#[test]
+fn meatpack_text_budget_can_run_out_before_a_bad_command() {
+    let mut bytes = header(1, false);
+    let prefix = vec![b' '; 512 * 1024];
+    bytes.extend(block(1, 0, prefix.len(), &[0, 0], &prefix, false));
+    let offset = bytes.len();
+    let mut packed = vec![255, 255, 251];
+    packed.extend([0x11; 40]);
+    packed.extend([255, 255, 0]);
+    bytes.extend(block(1, 0, packed.len(), &[2, 0], &packed, false));
+    bytes.extend(block(1, 0, 1, &[2, 0], b"G", false));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for (limit, expected) in [
+        (prefix.len() + packed.len() + 1, "size limit"),
+        (usize::MAX, "unsupported MeatPack command"),
+    ] {
+        let error = pool
+            .install(|| {
+                decode_bgcode_with_limits(
+                    &bytes,
+                    DecodeLimits {
+                        max_total_bytes: limit,
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap_err();
+        assert_eq!(error.offset, offset);
+        assert!(error.message.contains(expected));
+    }
 }
 
 #[test]

@@ -8,7 +8,7 @@
 //! References: <https://github.com/prusa3d/libbgcode/blob/main/doc/specifications.md>
 //! and the MeatPack format described by that repository's `meatpack.cpp`.
 
-use std::{error::Error, fmt};
+use std::{borrow::Cow, error::Error, fmt};
 
 use flate2::{Decompress, FlushDecompress, Status};
 
@@ -85,6 +85,114 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Block<'a> {
+    offset: usize,
+    block_type: u16,
+    compression: u16,
+    encoding: u16,
+    uncompressed_size: usize,
+    payload: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    fn block(
+        &mut self,
+        checksum_type: u16,
+        limits: DecodeLimits,
+        blocks: &mut usize,
+        decompressed_total: &mut usize,
+    ) -> Result<Block<'a>, BgcodeError> {
+        *blocks += 1;
+        let offset = self.pos;
+        if *blocks > limits.max_blocks {
+            return Err(BgcodeError::new(offset, "too many binary blocks"));
+        }
+        let block_type = self.u16()?;
+        if block_type > 5 {
+            return Err(BgcodeError::new(offset, "unsupported block type"));
+        }
+        let compression = self.u16()?;
+        if compression > 3 {
+            return Err(BgcodeError::new(
+                offset + 2,
+                "unsupported compression method",
+            ));
+        }
+        let uncompressed_size = self.u32()? as usize;
+        let payload_size = if compression == 0 {
+            uncompressed_size
+        } else {
+            self.u32()? as usize
+        };
+        if uncompressed_size > limits.max_block_bytes || payload_size > limits.max_block_bytes {
+            return Err(BgcodeError::new(
+                offset,
+                "block exceeds configured size limit",
+            ));
+        }
+        *decompressed_total = decompressed_total
+            .checked_add(uncompressed_size)
+            .filter(|n| *n <= limits.max_total_bytes)
+            .ok_or_else(|| BgcodeError::new(offset, "total decompression exceeds size limit"))?;
+
+        let encoding = self.u16()?;
+        if block_type == 5 {
+            let width = self.u16()?;
+            let height = self.u16()?;
+            if encoding > 2 || width == 0 || height == 0 {
+                return Err(BgcodeError::new(
+                    offset,
+                    "invalid thumbnail format or dimensions",
+                ));
+            }
+        }
+        let payload = self.take(payload_size)?;
+        let checksum_end = self.pos;
+        if checksum_type == 1 {
+            let stored = self.u32()?;
+            let calculated = crc32fast::hash(&self.bytes[offset..checksum_end]);
+            if stored != calculated {
+                return Err(BgcodeError::new(
+                    offset,
+                    format!("CRC32 mismatch (stored {stored:08x}, calculated {calculated:08x})"),
+                ));
+            }
+        }
+
+        Ok(Block {
+            offset,
+            block_type,
+            compression,
+            encoding,
+            uncompressed_size,
+            payload,
+        })
+    }
+}
+
+impl<'a> Block<'a> {
+    fn is_meatpack(&self) -> bool {
+        self.block_type == 1 && matches!(self.encoding, 1 | 2)
+    }
+    fn unpack(self) -> Result<Cow<'a, [u8]>, BgcodeError> {
+        let Self {
+            compression,
+            payload,
+            uncompressed_size,
+            offset,
+            ..
+        } = self;
+        Ok(Cow::Owned(match compression {
+            0 => return Ok(Cow::Borrowed(payload)),
+            1 => inflate_exact(payload, uncompressed_size, offset)?,
+            2 => heatshrink(payload, uncompressed_size, 11, offset)?,
+            3 => heatshrink(payload, uncompressed_size, 12, offset)?,
+            _ => unreachable!(),
+        }))
+    }
+}
+
 /// Decode G-code blocks and preserve metadata as semicolon comments.
 ///
 /// Block boundaries do not insert line breaks into G-code. MeatPack produces
@@ -124,85 +232,22 @@ pub(crate) fn decode(
 
     let mut output = String::new();
     let mut metadata = String::new();
-    let mut decompressed_total = 0usize;
-    let mut blocks = 0usize;
-    let mut found_gcode = false;
-
-    while reader.pos < bytes.len() {
-        blocks += 1;
-        let offset = reader.pos;
-        if blocks > limits.max_blocks {
-            return Err(BgcodeError::new(offset, "too many binary blocks"));
-        }
-        let block_type = reader.u16()?;
-        if block_type > 5 {
-            return Err(BgcodeError::new(offset, "unsupported block type"));
-        }
-        let compression = reader.u16()?;
-        if compression > 3 {
-            return Err(BgcodeError::new(
-                offset + 2,
-                "unsupported compression method",
-            ));
-        }
-        let uncompressed_size = reader.u32()? as usize;
-        let payload_size = if compression == 0 {
-            uncompressed_size
-        } else {
-            reader.u32()? as usize
-        };
-        if uncompressed_size > limits.max_block_bytes || payload_size > limits.max_block_bytes {
-            return Err(BgcodeError::new(
-                offset,
-                "block exceeds configured size limit",
-            ));
-        }
-        decompressed_total = decompressed_total
-            .checked_add(uncompressed_size)
-            .filter(|n| *n <= limits.max_total_bytes)
-            .ok_or_else(|| BgcodeError::new(offset, "total decompression exceeds size limit"))?;
-
-        let encoding = reader.u16()?;
-        if block_type == 5 {
-            let width = reader.u16()?;
-            let height = reader.u16()?;
-            if encoding > 2 || width == 0 || height == 0 {
-                return Err(BgcodeError::new(
-                    offset,
-                    "invalid thumbnail format or dimensions",
-                ));
-            }
-        }
-        let payload = reader.take(payload_size)?;
-        let checksum_end = reader.pos;
-        if checksum_type == 1 {
-            let stored = reader.u32()?;
-            let calculated = crc32fast::hash(&bytes[offset..checksum_end]);
-            if stored != calculated {
-                return Err(BgcodeError::new(
-                    offset,
-                    format!("CRC32 mismatch (stored {stored:08x}, calculated {calculated:08x})"),
-                ));
-            }
-        }
-
-        // Avoid a second allocation for uncompressed blocks.
-        let decompressed;
-        let raw = if compression == 0 {
-            payload
-        } else {
-            decompressed = match compression {
-                1 => inflate_exact(payload, uncompressed_size, offset)?,
-                2 => heatshrink(payload, uncompressed_size, 11, offset)?,
-                3 => heatshrink(payload, uncompressed_size, 12, offset)?,
-                _ => unreachable!(),
-            };
-            decompressed.as_slice()
-        };
-
+    let mut body_start = None;
+    unpack_blocks(&mut reader, checksum_type, limits, |block, raw| {
+        let Block {
+            offset,
+            block_type,
+            encoding,
+            ..
+        } = block;
         match block_type {
             1 => {
-                found_gcode = true;
+                // Most producers put all metadata first. Append the body to
+                // that buffer directly, so normal files need no final copy.
+                if body_start.is_none() {
+                    body_start = Some(metadata.len());
+                    output = std::mem::take(&mut metadata);
+                }
                 let decoded;
                 let text_bytes = match encoding {
                     0 => raw,
@@ -259,26 +304,98 @@ pub(crate) fn decode(
                     _ => return Err(BgcodeError::new(offset, "unsupported metadata encoding")),
                 }
                 if let Some(info) = &mut info {
-                    info.body_offset = metadata.len();
+                    info.body_offset = body_start.unwrap_or(0) + metadata.len();
                 }
             }
         }
-        if output.len().saturating_add(metadata.len()) > limits.max_total_bytes {
-            return Err(BgcodeError::new(offset, "decoded text exceeds size limit"));
-        }
-    }
+        limits
+            .max_total_bytes
+            .checked_sub(output.len().saturating_add(metadata.len()))
+            .ok_or_else(|| BgcodeError::new(offset, "decoded text exceeds size limit"))
+    })?;
 
-    if !found_gcode {
-        return Err(BgcodeError::new(reader.pos, "no G-code blocks found"));
-    }
+    let start = body_start.ok_or_else(|| BgcodeError::new(reader.pos, "no G-code blocks found"))?;
     // Metadata is placed first even if a permissive producer wrote it later.
     // This also prevents it from splitting a command spanning two data blocks.
-    if metadata.is_empty() {
-        Ok(output)
-    } else {
-        metadata.push_str(&output);
-        Ok(metadata)
+    if !metadata.is_empty() {
+        output.insert_str(start, &metadata);
     }
+    Ok(output)
+}
+
+fn unpack_blocks(
+    reader: &mut Reader<'_>,
+    checksum_type: u16,
+    limits: DecodeLimits,
+    mut consume: impl FnMut(Block<'_>, &[u8]) -> Result<usize, BgcodeError>,
+) -> Result<(), BgcodeError> {
+    let size = reader.bytes.len();
+    let mut count = 0;
+    let mut decompressed = 0;
+    let mut blocks = std::iter::from_fn(|| {
+        (reader.pos < size)
+            .then(|| reader.block(checksum_type, limits, &mut count, &mut decompressed))
+    })
+    .peekable();
+    const WINDOW: usize = 2 * 1024 * 1024;
+    let mut batch = Vec::new();
+    let mut remaining_text = limits.max_total_bytes;
+    while let Some(block) = blocks.next() {
+        let block = block?;
+        if (block.compression == 0 && !block.is_meatpack())
+            || size < 512 * 1024
+            || block.uncompressed_size >= WINDOW
+            || rayon::current_num_threads() == 1
+        {
+            remaining_text = consume(block, &block.unpack()?)?;
+            continue;
+        }
+        let mut available = WINDOW - block.uncompressed_size;
+        batch.clear();
+        batch.push(block);
+        while batch.len() < 32
+            && let Some(Ok(next)) =
+                blocks.next_if(|r| r.as_ref().is_ok_and(|b| b.uncompressed_size <= available))
+        {
+            available -= next.uncompressed_size;
+            batch.push(next);
+        }
+        if batch.len() == 1 {
+            remaining_text = consume(block, &block.unpack()?)?;
+        } else {
+            use rayon::prelude::*;
+            // Decode independent blocks together. Interpret them in order so
+            // byte limits, intermediate metadata and the first error stay exact.
+            // A MeatPack input byte emits at most two text bytes. When every
+            // block is G-code and all text fits, the limit cannot interrupt a
+            // token. Otherwise decode tokens in order with the exact budget.
+            let expand_text = (WINDOW - available) * 2 <= remaining_text
+                && batch.iter().all(|b| b.block_type == 1);
+            let decoded: Vec<_> = batch
+                .par_iter()
+                .map(|&block| {
+                    let raw = block.unpack()?;
+                    if expand_text && block.is_meatpack() {
+                        let text = meatpack(&raw, 2 * raw.len(), block.offset)?;
+                        Ok((
+                            Block {
+                                encoding: 0,
+                                ..block
+                            },
+                            Cow::Owned(text),
+                        ))
+                    } else {
+                        Ok((block, raw))
+                    }
+                })
+                .collect();
+            for result in decoded {
+                let (block, raw) = result?;
+                remaining_text = consume(block, &raw)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn append_bounded(
@@ -373,68 +490,60 @@ fn inflate_exact(payload: &[u8], expected: usize, offset: usize) -> Result<Vec<u
     Ok(out)
 }
 
-struct Bits<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    offset: usize,
-}
-
-impl Bits<'_> {
-    fn read(&mut self, count: usize) -> Result<usize, BgcodeError> {
-        if self.pos.saturating_add(count) > self.bytes.len().saturating_mul(8) {
-            return Err(BgcodeError::new(self.offset, "truncated Heatshrink stream"));
-        }
-        let mut result = 0;
-        for _ in 0..count {
-            result =
-                (result << 1) | usize::from((self.bytes[self.pos / 8] >> (7 - self.pos % 8)) & 1);
-            self.pos += 1;
-        }
-        Ok(result)
-    }
-}
-
 fn heatshrink(
-    payload: &[u8],
+    mut payload: &[u8],
     expected: usize,
     window_bits: usize,
     offset: usize,
 ) -> Result<Vec<u8>, BgcodeError> {
-    let mut bits = Bits {
-        bytes: payload,
-        pos: 0,
-        offset,
-    };
-    let mut out = Vec::with_capacity(expected);
-    let mut window = vec![0u8; 1 << window_bits];
-    let mask = window.len() - 1;
-    let mut head = 0usize;
-    while out.len() < expected {
-        if bits.read(1)? == 1 {
-            let byte = bits.read(8)? as u8;
-            out.push(byte);
-            window[head & mask] = byte;
-            head += 1;
+    let mut out = vec![0; expected];
+    let mut written = 0;
+    let mut skip = 0;
+    while written < expected {
+        // Even an unaligned window-12 match fits in three bytes (7 + 17 bits).
+        let word = if let Some(bytes) = payload.first_chunk::<4>() {
+            u32::from_be_bytes(*bytes)
         } else {
-            let distance = bits.read(window_bits)? + 1;
-            let length = bits.read(4)? + 1;
-            if length > expected - out.len() {
+            let mut tail = [0; 4];
+            tail[..payload.len()].copy_from_slice(payload);
+            u32::from_be_bytes(tail)
+        } << skip;
+        let literal = word >> 31 != 0;
+        let used = skip + if literal { 9 } else { window_bits + 5 };
+        if payload.len() < 3 && used > payload.len() * 8 {
+            return Err(BgcodeError::new(offset, "truncated Heatshrink stream"));
+        }
+        payload = &payload[used / 8..];
+        skip = used % 8;
+        if literal {
+            out[written] = (word >> 23) as u8;
+            written += 1;
+        } else {
+            let distance = ((word << 1) >> (32 - window_bits)) as usize + 1;
+            let length = ((word >> (27 - window_bits)) & 15) as usize + 1;
+            if length > expected - written {
                 return Err(BgcodeError::new(
                     offset,
                     "Heatshrink output exceeds declared size",
                 ));
             }
-            for _ in 0..length {
-                // The initial window contains zeroes, as in reference heatshrink.
-                let byte = window[head.wrapping_sub(distance) & mask];
-                out.push(byte);
-                window[head & mask] = byte;
-                head += 1;
+            let end = written + length;
+            // References before the first byte read from a zero-filled dictionary.
+            written = written.max(distance.min(end));
+            if written < end {
+                let source = written - distance;
+                if end - written <= distance {
+                    out.copy_within(source..source + (end - written), written);
+                } else {
+                    for i in written..end {
+                        out[i] = out[i - distance];
+                    }
+                }
             }
+            written = end;
         }
     }
-    let remaining = payload.len() * 8 - bits.pos;
-    if remaining >= 8 || bits.read(remaining)? != 0 {
+    if !(payload.is_empty() || matches!(payload, [last] if skip != 0 && last << skip == 0)) {
         return Err(BgcodeError::new(
             offset,
             "Heatshrink stream has non-padding trailing data",
@@ -444,14 +553,38 @@ fn heatshrink(
 }
 
 fn meatpack(payload: &[u8], limit: usize, offset: usize) -> Result<Vec<u8>, BgcodeError> {
+    const fn pairs(alphabet: &[u8; 16]) -> [[u8; 2]; 256] {
+        let mut table = [[0; 2]; 256];
+        let mut i = 0;
+        while i < 256 {
+            table[i] = [alphabet[i & 15], alphabet[i >> 4]];
+            i += 1;
+        }
+        table
+    }
+    static SPACES: [[u8; 2]; 256] = pairs(b"0123456789. \nGX\0");
+    static EXTRUSION: [[u8; 2]; 256] = pairs(b"0123456789.E\nGX\0");
+    let mut alphabet = &SPACES;
     let mut out = Vec::with_capacity(payload.len().min(limit));
     let mut pos = 0;
     let mut packing = false;
-    let mut no_spaces = false;
     let mut pending_raw = 0;
     let mut held = None;
     while pos < payload.len() {
         let byte = payload[pos];
+        if !packing && byte != 0xff {
+            let rest = &payload[pos..];
+            let n = memchr::memchr(0xff, rest).unwrap_or(rest.len());
+            if n > limit - out.len() {
+                return Err(BgcodeError::new(
+                    offset,
+                    "MeatPack output exceeds size limit",
+                ));
+            }
+            out.extend_from_slice(&rest[..n]);
+            pos += n;
+            continue;
+        }
         pos += 1;
         if byte == 0xff && payload.get(pos) == Some(&0xff) {
             pos += 1;
@@ -470,11 +603,11 @@ fn meatpack(payload: &[u8], limit: usize, offset: usize) -> Result<Vec<u8>, Bgco
                 250 => packing = false,
                 249 => {
                     packing = false;
-                    no_spaces = false;
+                    alphabet = &SPACES;
                 }
                 248 => {} // Query configuration emits no G-code.
-                247 => no_spaces = true,
-                246 => no_spaces = false,
+                247 => alphabet = &EXTRUSION,
+                246 => alphabet = &SPACES,
                 _ => return Err(BgcodeError::new(offset, "unsupported MeatPack command")),
             }
             continue;
@@ -490,31 +623,22 @@ fn meatpack(payload: &[u8], limit: usize, offset: usize) -> Result<Vec<u8>, Bgco
         } else if !packing {
             out.push(byte);
         } else {
-            let decode_nibble = |n: u8| {
-                if n == 11 && no_spaces {
-                    b'E'
-                } else {
-                    b"0123456789. \nGX"[usize::from(n)]
-                }
-            };
-            let low = byte & 15;
-            let high = byte >> 4;
-            if low == 15 {
-                pending_raw = if high == 15 { 2 } else { 1 };
-                if high != 15 {
-                    held = Some(decode_nibble(high));
-                }
-            } else {
-                let first = decode_nibble(low);
-                out.push(first);
-                // The upper nibble is padding when the low nibble ends a line.
-                if first != b'\n' {
-                    if high == 15 {
-                        pending_raw = 1;
-                    } else {
-                        out.push(decode_nibble(high));
+            // Zero marks an escaped nibble. Most bytes expand to two digits.
+            let pair = alphabet[usize::from(byte)];
+            match pair {
+                [0, second] => {
+                    pending_raw = if second == 0 { 2 } else { 1 };
+                    if second != 0 {
+                        held = Some(second);
                     }
                 }
+                // The upper nibble is padding when the low nibble ends a line.
+                [b'\n', _] => out.push(b'\n'),
+                [first, 0] => {
+                    out.push(first);
+                    pending_raw = 1;
+                }
+                _ => out.extend_from_slice(&pair),
             }
         }
         if out.len() > limit {

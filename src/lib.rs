@@ -70,15 +70,35 @@ pub(crate) fn load_with<T>(
     parse: impl FnOnce(&str, Option<&mut print_info::Collector>) -> Result<T, parser::ParseError>,
 ) -> Result<T, LoadError> {
     let file = File::open(path).map_err(LoadError::Io)?;
-    let size = file.metadata().map_err(LoadError::Io)?.len();
-    if size > MAX_INPUT_BYTES {
+    let metadata = file.metadata().map_err(LoadError::Io)?;
+    if metadata.len() > MAX_INPUT_BYTES {
         return Err(LoadError::TooLarge);
     }
-    let mut bytes = Vec::with_capacity(size as usize);
-    file.take(MAX_INPUT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(LoadError::Io)?;
+    let bytes = read_input(&file, &metadata).map_err(LoadError::Io)?;
     decode_with(&bytes, info, parse)
+}
+
+fn read_input(file: &File, metadata: &std::fs::Metadata) -> std::io::Result<Vec<u8>> {
+    let size = metadata.len() as usize;
+    #[cfg(unix)]
+    if metadata.is_file() && size >= 2 * 1024 * 1024 && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        use std::os::unix::fs::FileExt;
+        const CHUNK: usize = 1024 * 1024;
+        let mut bytes = vec![0; size];
+        // Copy and fault in independent pages in parallel. Positional reads
+        // leave the file cursor at zero for the streaming fallback below.
+        let read = bytes
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .try_for_each(|(i, dst)| file.read_exact_at(dst, (i * CHUNK) as u64));
+        if read.is_ok() && matches!(file.read_at(&mut [0], size as u64), Ok(0)) {
+            return Ok(bytes);
+        }
+    }
+    let mut bytes = Vec::with_capacity(size);
+    file.take(MAX_INPUT_BYTES + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Decode an in-memory text or binary G-code file.
@@ -114,4 +134,27 @@ pub fn save_png(frame: &renderer::Frame, path: impl AsRef<Path>) -> image::Image
         image::ColorType::Rgba8,
         image::ImageFormat::Png,
     )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{io::Seek, os::unix::fs::FileExt};
+
+    #[test]
+    fn reads_to_the_actual_end_when_a_file_changes_size() {
+        let path = std::env::temp_dir().join(format!("gcv-read-{}", std::process::id()));
+        let mut file = File::create_new(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        file.set_len(3 * 1024 * 1024).unwrap();
+        let snapshot = file.metadata().unwrap();
+        for size in [snapshot.len() + 64, 16] {
+            file.set_len(size).unwrap();
+            file.write_all_at(b"tail", size - 4).unwrap();
+            file.rewind().unwrap();
+            let bytes = read_input(&file, &snapshot).unwrap();
+            assert_eq!(bytes.len() as u64, size);
+            assert!(bytes.ends_with(b"tail"));
+        }
+    }
 }
