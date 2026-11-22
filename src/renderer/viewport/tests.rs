@@ -59,7 +59,7 @@ fn viewport_agrees_with_png_across_display_controls() {
         "../../../tests/fixtures/bgcode/reference.gcode"
     ))
     .unwrap();
-    let model = Model::new(&state.device, reference.clone());
+    let model = Model::new(&state.device, reference.clone(), 1.);
     let mut view = Viewport::new(state);
     let mut o = RenderOptions {
         width: 311,
@@ -121,7 +121,7 @@ fn short_crossing_strokes_use_centerline_depth() {
     let mut data=parse_gcode(&format!("G90\nM83\n;TYPE:Perimeter\nG0 X{} Y{} Z2\nG1 X{} Z0 E1\n;TYPE:Infill\nG0 X{} Y{} Z1.6\nG1 Y{} E1",x(50.),y(50.5),x(54.),x(50.5),y(45.),y(55.))).unwrap();
     data.bed_x = 100.;
     data.bed_y = 100.;
-    let model = Model::new(&state.device, data);
+    let model = Model::new(&state.device, data, 1.);
     let mut v = Viewport::new(state);
     let mut o = RenderOptions {
         width: 100,
@@ -147,6 +147,38 @@ fn short_crossing_strokes_use_centerline_depth() {
 }
 
 #[test]
+fn translucent_supports_match_png_in_scalar_and_feature_views() {
+    let Some(state) = gpu() else { return };
+    let data = parse_gcode("M83\n;TYPE:Support\nG0 X0 Z3\nG1 X20 E1 F3000\nG0 X0\nG1 X20 E1\n;TYPE:Perimeter\nG0 X0 Z2\nG1 X20 E1 F1200").unwrap();
+    let mut v = Viewport::new(state.clone());
+    for opacity in [0., 0.5, 1.] {
+        let model = Model::new(&state.device, data.clone(), opacity);
+        for mode in [ColorMode::Feature, ColorMode::Speed] {
+            let o = RenderOptions {
+                width: 101,
+                height: 81,
+                show_bed: false,
+                show_legend: false,
+                line_width: 4.,
+                support_opacity: opacity,
+                color_mode: mode,
+                camera: Camera {
+                    perspective: false,
+                    ..Camera::from_preset(CameraPreset::Top)
+                },
+                ..Default::default()
+            };
+            v.image(&model, &o, true, false).unwrap();
+            let i = (40 * 101 + 50) * 4;
+            let gpu = pixels(&v);
+            let cpu = render(&model.data, &o).unwrap();
+            assert_ne!(cpu.rgba[i..i + 3], BACKGROUND);
+            assert!((i..i + 3).all(|i| gpu[i].abs_diff(cpu.rgba[i]) <= 3));
+        }
+    }
+}
+
+#[test]
 fn thin_diagonal_print_fills_the_same_view_as_the_export() {
     use std::fmt::Write;
     let Some(state) = gpu() else {
@@ -158,7 +190,7 @@ fn thin_diagonal_print_fills_the_same_view_as_the_export() {
             let x = 100. * i as f64 / count as f64;
             writeln!(text, "G1 X{x} Y{} E0.01", 100. - x).unwrap();
         }
-        let model = Model::new(&state.device, parse_gcode(&text).unwrap());
+        let model = Model::new(&state.device, parse_gcode(&text).unwrap(), 1.);
         let mut v = Viewport::new(state.clone());
         let mut o = RenderOptions {
             width: 500,
@@ -200,7 +232,7 @@ fn hidden_travel_between_separate_islands_does_not_shrink_the_view() {
         writeln!(text, "G0 X{x} Y{y}").unwrap();
         text.push_str(&format!("G1 X{} E0.1\nG1 X{x} E0.1\n", x + 1).repeat(1024));
     }
-    let model = Model::new(&state.device, parse_gcode(&text).unwrap());
+    let model = Model::new(&state.device, parse_gcode(&text).unwrap(), 1.);
     let mut view = Viewport::new(state);
     let mut options = RenderOptions {
         width: 500,
@@ -247,7 +279,7 @@ fn moving_view_keeps_layer_endpoints_and_restores_full_detail() {
         )
         .unwrap();
     }
-    let model = Model::new(&state.device, parse_gcode(&gcode).unwrap());
+    let model = Model::new(&state.device, parse_gcode(&gcode).unwrap(), 1.);
     let mut v = Viewport::new(state);
     let mut o = RenderOptions {
         width: 640,
@@ -293,13 +325,16 @@ fn orbit_timing() {
     let data = crate::load_with(&path, None, crate::parser::parse_compact).unwrap();
     let parse = parse_started.elapsed();
     let now = Instant::now();
-    let model = Model::new(&state.device, data);
+    let support_opacity =
+        std::env::var("GCV_BENCH_SUPPORT_OPACITY").map_or(1., |s| s.parse().unwrap());
+    let model = Model::new(&state.device, data, support_opacity);
     let upload = now.elapsed();
     let adapter = state.adapter.get_info();
     let mut v = Viewport::new(state);
     let mut o = RenderOptions {
         width: 1280,
         height: 900,
+        support_opacity,
         show_bed: false,
         show_legend: false,
         ..Default::default()

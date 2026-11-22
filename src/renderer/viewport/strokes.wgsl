@@ -42,10 +42,11 @@ struct Stroke {
     var q = project(end);
     var width = cam.style.x;
     var color: vec4f;
-    if hi.w >= 2u {
+    // Stroke kinds: opaque extrusion, support, travel, bed, axis label.
+    if hi.w >= 3u {
         color = vec4f(vec3f(lo.xyz), f32(lo.w)) / 255.;
         width = f32(hi.z) / 10.;
-        if hi.w == 3u {
+        if hi.w == 4u {
             p = vec3f(floor(p.xy) + vec2f(hi.xy) + 0.5, p.z);
             q = p;
         }
@@ -55,7 +56,8 @@ struct Stroke {
         if mode >= 4u { index = hi[mode - 4u]; }
         color = unpack4x8unorm(palette[mode * 64u + index / 4u][index % 4u]);
         color = vec4f(color.rgb * (f32(hi.z) / 255.), 1.);
-        if hi.w == 1u { width = max(width * 0.45, 0.5); color.a = 0.15; }
+        if hi.w == 1u { color.a = cam.style.w; }
+        if hi.w == 2u { width = max(width * 0.45, 0.5); color.a = 0.15; }
     }
     let delta = q.xy - p.xy;
     let len = length(delta);

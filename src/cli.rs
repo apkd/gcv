@@ -47,6 +47,9 @@ pub struct Args {
     /// Display non-extruding moves
     #[arg(long)]
     pub show_travel: bool,
+    /// Opacity of each support line, from 0 (hidden) to 1 (opaque)
+    #[arg(long, default_value = "1", value_parser = opacity)]
+    pub support_opacity: f64,
     /// Hide the print bed and its grid
     #[arg(long)]
     pub no_bed: bool,
@@ -105,6 +108,15 @@ fn elevation(value: &str) -> Result<f64, String> {
     }
 }
 
+fn opacity(value: &str) -> Result<f64, String> {
+    finite_number(value).and_then(|n| {
+        (0.0..=1.)
+            .contains(&n)
+            .then_some(n)
+            .ok_or_else(|| "opacity must be between 0 and 1".into())
+    })
+}
+
 fn parse_camera(value: &str) -> Result<CameraPreset, String> {
     match value {
         "isometric" => Ok(CameraPreset::Isometric),
@@ -159,6 +171,7 @@ impl Args {
             layer_min: self.min_layer,
             layer_max: self.layer,
             show_travel: self.show_travel,
+            support_opacity: self.support_opacity,
             show_bed: !self.no_bed,
             color_mode: self.color_mode,
             camera,

@@ -16,7 +16,7 @@ use crate::{
     camera::Camera,
     colors::{self, BACKGROUND, TRAVEL_OPACITY},
     geometry::{PreviewLine, PreviewPaths, Print},
-    types::{Bounds, ColorMode, ToolpathData},
+    types::{Bounds, ColorMode, ExtrusionType, ToolpathData},
 };
 
 /// Limits both the RGBA image and the equally sized f32 depth buffer (~256 MiB).
@@ -31,6 +31,7 @@ pub struct RenderOptions {
     /// Inclusive maximum; `None` selects the final layer.
     pub layer_max: Option<usize>,
     pub show_travel: bool,
+    pub support_opacity: f64,
     pub show_bed: bool,
     pub color_mode: ColorMode,
     pub camera: Camera,
@@ -47,6 +48,7 @@ impl Default for RenderOptions {
             layer_min: 0,
             layer_max: None,
             show_travel: false,
+            support_opacity: 1.,
             show_bed: true,
             color_mode: ColorMode::Feature,
             camera: Camera::default(),
@@ -65,6 +67,11 @@ impl RenderOptions {
     }
     fn validate(&self) -> Result<(), RenderError> {
         validate_dimensions(self.width, self.height)?;
+        if !(0.0..=1.).contains(&self.support_opacity) {
+            return Err(RenderError(
+                "support opacity must be between 0 and 1".into(),
+            ));
+        }
         if !self.camera.valid() {
             return Err(RenderError("camera values must be finite; zoom must be in (0, 1000], elevation in [-90, 90], and pan in [-100, 100]".into()));
         }
@@ -74,6 +81,43 @@ impl RenderOptions {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Opaque,
+    Support,
+    Travel,
+}
+
+impl Pass {
+    fn of(feature: ExtrusionType, travel: bool, split_support: bool) -> Self {
+        if travel {
+            Self::Travel
+        } else if split_support && feature == ExtrusionType::SupportMaterial {
+            Self::Support
+        } else {
+            Self::Opaque
+        }
+    }
+
+    fn visible(support_opacity: f64, travel: bool) -> impl Iterator<Item = Self> {
+        [Self::Opaque, Self::Support, Self::Travel]
+            .into_iter()
+            .filter(move |pass| match pass {
+                Self::Opaque => true,
+                Self::Support => support_opacity > 0. && support_opacity < 1.,
+                Self::Travel => travel,
+            })
+    }
+
+    fn opacity(self, options: &RenderOptions) -> f64 {
+        match self {
+            Self::Opaque => 1.,
+            Self::Support => options.support_opacity,
+            Self::Travel => TRAVEL_OPACITY,
+        }
     }
 }
 
@@ -942,18 +986,27 @@ fn render_lines<C: Sync, I: ExactSizeIterator<Item = PreviewLine>>(
     let legend = Legend::new(options, info, || entries);
     let (mut raster, projection) = canvas(bed, options, &subject, legend.as_ref())?;
     let serial = chunks.iter().map(|c| lines(c).len()).sum::<usize>() < 16_384;
-    // Opaque extrusion first. Travels are then composited against the same depth
-    // buffer but do not write it, so a translucent travel cannot hide a surface.
-    for travel_pass in [false, true] {
-        if travel_pass && !options.show_travel {
-            continue;
-        }
+    // Translucent strokes test the opaque depth but do not write it.
+    let split_support = options.support_opacity < 1.
+        && chunks
+            .iter()
+            .any(|c| lines(c).any(|s| s.feature == ExtrusionType::SupportMaterial));
+    for pass in Pass::visible(
+        if split_support {
+            options.support_opacity
+        } else {
+            1.
+        },
+        options.show_travel,
+    ) {
+        let travel_pass = pass == Pass::Travel;
+        let selected = |s: &PreviewLine| Pass::of(s.feature, s.travel, split_support) == pass;
         let width = if travel_pass {
             (options.line_width * 0.45).max(0.5)
         } else {
             options.line_width
         };
-        let opacity = if travel_pass { TRAVEL_OPACITY } else { 1. };
+        let opacity = pass.opacity(options);
         let (viewport_width, viewport_height) = (
             f64::from(raster.frame.width),
             f64::from(raster.frame.height),
@@ -987,14 +1040,10 @@ fn render_lines<C: Sync, I: ExactSizeIterator<Item = PreviewLine>>(
             Ok(Some((points, color)))
         };
         let paint = |band: &mut Band<'_>, y, (points, color)| {
-            band.paint(points, y, || color, width, opacity, !travel_pass)
+            band.paint(points, y, || color, width, opacity, pass == Pass::Opaque)
         };
         if serial {
-            for s in chunks
-                .iter()
-                .flat_map(&lines)
-                .filter(|s| s.travel == travel_pass)
-            {
+            for s in chunks.iter().flat_map(&lines).filter(selected) {
                 if let Some(line) = project(s)? {
                     paint(&mut raster.band(), 0, line);
                 }
@@ -1005,7 +1054,7 @@ fn render_lines<C: Sync, I: ExactSizeIterator<Item = PreviewLine>>(
                 width,
                 chunks,
                 |chunk, projected| {
-                    for s in lines(chunk).filter(|s| s.travel == travel_pass) {
+                    for s in lines(chunk).filter(selected) {
                         if let Some(line) = project(s)? {
                             projected.push(line);
                         }

@@ -132,7 +132,11 @@ fn file_reload_replaces_geometry_and_resets_layers() {
     app.events_tx
         .send(Event::Loaded(
             PathBuf::from("new.gcode"),
-            Ok(Box::new(Model::new(&app.viewport.state.device, new_data))),
+            Ok(Box::new(Model::new(
+                &app.viewport.state.device,
+                new_data,
+                app.options.support_opacity,
+            ))),
         ))
         .unwrap();
     app.receive(&ctx);

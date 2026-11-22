@@ -3,7 +3,7 @@ mod detail;
 mod scene;
 #[cfg(test)]
 mod tests;
-use super::{Projection, RenderOptions, bed_lines, glyph};
+use super::{Pass, Projection, RenderOptions, bed_lines, glyph};
 use crate::{
     colors::{self, BACKGROUND},
     geometry::DetailedPrint,
@@ -38,10 +38,14 @@ pub(crate) struct Model {
 }
 
 impl Model {
-    pub fn new(device: &wgpu::Device, data: impl Into<DetailedPrint>) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        data: impl Into<DetailedPrint>,
+        support_opacity: f64,
+    ) -> Self {
         let data = data.into();
         let (ranges, legends) = colors::Legends::collect(&data);
-        let scene = Scene::upload(device, &data, &ranges);
+        let scene = Scene::upload(device, &data, &ranges, support_opacity);
         let mut strokes = Vec::new();
         let labels = bed_lines(
             [data.bed_x, data.bed_y],
@@ -54,7 +58,7 @@ impl Model {
                     0,
                     0,
                     (w * 10.).round() as u8,
-                    2,
+                    3,
                 ];
                 strokes.push(Stroke::new(a, b, scene.origin, style));
             },
@@ -67,7 +71,7 @@ impl Model {
                             p,
                             p,
                             scene.origin,
-                            [r, g, b, 255, x, y as u8, 10, 3],
+                            [r, g, b, 255, x, y as u8, 10, 4],
                         ));
                     }
                 }
@@ -96,7 +100,7 @@ pub(crate) struct Viewport {
     bind: wgpu::BindGroup,
     plate: wgpu::RenderPipeline,
     extrusion: wgpu::RenderPipeline,
-    travel: wgpu::RenderPipeline,
+    translucent: wgpu::RenderPipeline,
     target: Option<Target>,
 }
 
@@ -201,7 +205,7 @@ impl Viewport {
         };
         let plate = pipeline("plate", "plate_color", false);
         let extrusion = pipeline("stroke", "ink", true);
-        let travel = pipeline("stroke", "ink", false);
+        let translucent = pipeline("stroke", "ink", false);
         Self {
             #[cfg(test)]
             drawn_strokes: 0,
@@ -210,7 +214,7 @@ impl Viewport {
             bind,
             plate,
             extrusion,
-            travel,
+            translucent,
             target: None,
         }
     }
@@ -362,7 +366,7 @@ impl Viewport {
                 o.line_width as f32,
                 o.color_mode as u8 as f32,
                 u8::from(p.perspective) as f32,
-                0.,
+                model.scene.support_opacity as f32,
             ],
             [bed[0] as f32, bed[1] as f32, 0., 0.],
             vec4(model.scene.origin, 0.),
@@ -410,13 +414,13 @@ impl Viewport {
                 pass.set_vertex_buffer(0, model.bed.slice(..));
                 pass.draw(0..4, 0..model.bed_lines);
             }
-            for (i, pipeline) in [&self.extrusion, &self.travel]
-                .into_iter()
-                .take(if o.show_travel { 2 } else { 1 })
-                .enumerate()
-            {
-                pass.set_pipeline(pipeline);
-                for (batch, range) in model.scene.draws(layers.clone(), i) {
+            for kind in Pass::visible(model.scene.support_opacity, o.show_travel) {
+                pass.set_pipeline(if kind == Pass::Opaque {
+                    &self.extrusion
+                } else {
+                    &self.translucent
+                });
+                for (batch, range) in model.scene.draws(layers.clone(), kind) {
                     batch.draw(range, error, |buffer, range| {
                         #[cfg(test)]
                         {

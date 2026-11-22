@@ -1,10 +1,10 @@
 //! Whole-print feature exports: project compact arcs and paint independent row bands.
 use super::{
-    Frame, Legend, Projection, Raster, RenderError, RenderOptions, Role, ScreenPoint, Subject,
-    canvas, colors, corners, tangent_color,
+    Frame, Legend, Pass, Projection, Raster, RenderError, RenderOptions, Role, ScreenPoint,
+    Subject, canvas, colors, corners, tangent_color,
 };
 use crate::geometry::{FeaturePaths, Print, Stroke, StrokeBatch};
-use crate::types::Bounds;
+use crate::types::{Bounds, ExtrusionType};
 
 pub(crate) fn render_features(
     print: &Print<FeaturePaths>,
@@ -20,21 +20,80 @@ pub(crate) fn render_features(
     if let Some(bounds) = subject.bounds() {
         tolerance[subject.role as usize] = arc_tolerance(&p, bounds);
     }
-    if geom.batches.iter().map(|b| b.strokes.len()).sum::<usize>() < 16_384 {
-        for b in &geom.batches {
-            project_strokes(&p, b, &b.strokes, tolerance, |[a, end], ink| {
-                raster
-                    .band()
-                    .line(a, end, || ink.resolve(b), options.line_width, 1., true)
-            });
-        }
-    } else {
-        draw_bands(&mut raster, &p, geom, tolerance, options.line_width)?;
-    }
+    let serial = geom.batches.iter().map(|b| b.strokes.len()).sum::<usize>() < 16_384;
+    draw_strokes(&mut raster, &p, geom, tolerance, options, serial)?;
     if let Some(legend) = legend {
         legend.draw(&mut raster);
     }
     Ok(raster.frame)
+}
+
+fn draw_strokes(
+    raster: &mut Raster,
+    p: &Projection,
+    geom: &FeaturePaths,
+    tolerance: [f64; 2],
+    options: &RenderOptions,
+    serial: bool,
+) -> Result<(), RenderError> {
+    let chunks: Vec<_> = geom.chunks().collect();
+    let split =
+        options.support_opacity < 1. && geom.counts[ExtrusionType::SupportMaterial as usize] != 0;
+    for pass in Pass::visible(if split { options.support_opacity } else { 1. }, false) {
+        let selected = |s: &&Stroke| Pass::of(s.feature, false, split) == pass;
+        let opacity = pass.opacity(options);
+        let width = options.line_width;
+        if serial {
+            for &(b, strokes) in &chunks {
+                project_strokes(
+                    p,
+                    b,
+                    strokes.iter().filter(selected),
+                    tolerance,
+                    |[a, end], ink| {
+                        raster.band().line(
+                            a,
+                            end,
+                            || ink.resolve(b),
+                            width,
+                            opacity,
+                            pass == Pass::Opaque,
+                        );
+                    },
+                );
+            }
+        } else {
+            super::bands::draw(
+                raster,
+                width,
+                &chunks,
+                |&(geom, chunk), lines| {
+                    lines.reserve(chunk.len());
+                    project_strokes(
+                        p,
+                        geom,
+                        chunk.iter().filter(selected),
+                        tolerance,
+                        |pts, ink| lines.push((pts, ink)),
+                    );
+                    Ok(())
+                },
+                |band, y, ([mut a, mut b], ink), &(geom, _)| {
+                    a.y -= f64::from(y);
+                    b.y -= f64::from(y);
+                    band.line(
+                        a,
+                        b,
+                        || ink.resolve(geom),
+                        width,
+                        opacity,
+                        pass == Pass::Opaque,
+                    );
+                },
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn arc_tolerance(p: &Projection, bounds: Bounds) -> f64 {
@@ -75,10 +134,10 @@ impl Ink {
         }
     }
 }
-fn project_strokes(
+fn project_strokes<'a>(
     p: &Projection,
     geom: &StrokeBatch,
-    strokes: &[Stroke],
+    strokes: impl IntoIterator<Item = &'a Stroke>,
     tolerance: [f64; 2],
     mut draw: impl FnMut([ScreenPoint; 2], Ink),
 ) {
@@ -137,30 +196,6 @@ fn project_strokes(
     }
 }
 
-fn draw_bands(
-    raster: &mut Raster,
-    p: &Projection,
-    geom: &FeaturePaths,
-    tolerance: [f64; 2],
-    width: f64,
-) -> Result<(), RenderError> {
-    let chunks: Vec<_> = geom.chunks().collect();
-    super::bands::draw(
-        raster,
-        width,
-        &chunks,
-        |&(geom, chunk), lines| {
-            lines.reserve(chunk.len());
-            project_strokes(p, geom, chunk, tolerance, |pts, ink| lines.push((pts, ink)));
-            Ok(())
-        },
-        |band, y, ([mut a, mut b], ink), &(geom, _)| {
-            a.y -= f64::from(y);
-            b.y -= f64::from(y);
-            band.line(a, b, || ink.resolve(geom), width, 1., true);
-        },
-    )
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +222,46 @@ mod tests {
             }
         }
         (min, max)
+    }
+
+    #[test]
+    fn supports_blend_per_line_in_front_of_the_print() {
+        use crate::camera::{Camera, CameraPreset};
+        for compact in [false, true] {
+            let pixel = |z, repeats, support_opacity| {
+                // Emit supports first: the opaque model must still be drawn underneath.
+                let support = format!("G0 X0 Z{z}\nG1 X10 E1\n").repeat(repeats);
+                let text = format!(
+                    "M83\n;TYPE:Support interface\n{support};TYPE:Perimeter\nG0 X0 Z2\nG1 X10 E1"
+                );
+                let options = RenderOptions {
+                    width: 101,
+                    height: 81,
+                    show_bed: false,
+                    show_legend: false,
+                    line_width: 4.,
+                    support_opacity,
+                    camera: Camera {
+                        perspective: false,
+                        ..Camera::from_preset(CameraPreset::Top)
+                    },
+                    ..Default::default()
+                };
+                let frame = draw(&text, &options, compact);
+                let i = (40 * 101 + 50) * 4;
+                <[u8; 3]>::try_from(&frame.rgba[i..i + 3]).unwrap()
+            };
+            let model = pixel(3, 1, 0.);
+            let support = pixel(3, 1, 1.);
+            assert_ne!(model, support);
+            assert_eq!(pixel(1, 2, 0.5), model);
+            let mut expected = model;
+            for repeats in 1..=2 {
+                expected = std::array::from_fn(|i| expected[i].midpoint(support[i]));
+                let actual = pixel(3, repeats, 0.5);
+                assert!((0..3).all(|i| actual[i].abs_diff(expected[i]) <= 2));
+            }
+        }
     }
 
     #[test]
@@ -313,14 +388,8 @@ mod tests {
                     .build()
                     .unwrap()
                     .install(|| {
-                        draw_bands(
-                            &mut raster,
-                            &p,
-                            &print.geometry,
-                            [0.; 2],
-                            options.line_width,
-                        )
-                        .unwrap()
+                        draw_strokes(&mut raster, &p, &print.geometry, [0.; 2], &options, false)
+                            .unwrap()
                     });
             }
             raster.frame.rgba

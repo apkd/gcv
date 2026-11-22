@@ -77,6 +77,7 @@ gcv model.gcode -e output.png \
 | `--layer`, `-l` | all | Maximum layer to display |
 | `--resolution`, `-r` | `1920x1080` | Export resolution (WxH) |
 | `--show-travel` | off | Show travel moves |
+| `--support-opacity` | 1 | Opacity per support line, from 0 (hidden) to 1 (opaque) |
 | `--no-bed` | off | Hide print bed |
 | `--color-mode` | `feature` | `feature`, `height`, `speed`, `fan`, `temperature`, `flow` |
 | `--min-layer` | 0 | Minimum layer to display |

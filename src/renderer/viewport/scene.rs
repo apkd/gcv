@@ -1,5 +1,5 @@
 use super::super::{
-    Role,
+    Pass, Role,
     framing::index::{FramingIndex, Selection},
     tangent_shade,
 };
@@ -23,7 +23,7 @@ pub(super) struct Stroke {
 }
 
 impl Stroke {
-    fn model(segment: &Segment, origin: [f64; 3], ranges: &ColorRanges) -> Self {
+    fn model(segment: &Segment, origin: [f64; 3], ranges: &ColorRanges, pass: Pass) -> Self {
         let mut paint = [0; 8];
         paint[0] = segment.extrusion_type as u8;
         for mode in ColorMode::ALL.into_iter().skip(1) {
@@ -40,7 +40,7 @@ impl Stroke {
         } else {
             (tangent_shade(segment.start, segment.end) * 255.).round() as u8
         };
-        paint[7] = u8::from(segment.is_travel);
+        paint[7] = pass as u8;
         Self::new(segment.start, segment.end, origin, paint)
     }
 
@@ -58,20 +58,26 @@ impl Stroke {
 const BATCH: usize = 262_144;
 pub(crate) struct Scene {
     pub origin: [f64; 3],
-    buffers: [Vec<Batch>; 2],
+    buffers: [Vec<Batch>; 3],
     pub object_bounds: Bounds,
+    pub support_opacity: f64,
     framing: FramingIndex,
-    // Exclusive prefix counts for extrusion and travel, one pair per layer boundary.
-    offsets: Vec<[u32; 2]>,
+    // Exclusive stroke counts for each pass at every layer boundary.
+    offsets: Vec<[u32; 3]>,
 }
 
 impl Scene {
-    pub fn upload(device: &wgpu::Device, data: &DetailedPrint, ranges: &ColorRanges) -> Self {
+    pub fn upload(
+        device: &wgpu::Device,
+        data: &DetailedPrint,
+        ranges: &ColorRanges,
+        support_opacity: f64,
+    ) -> Self {
         let origin = data.bounds.center();
-        let mut buffers = [Vec::new(), Vec::new()];
-        let mut staging: [Vec<Stroke>; 2] = Default::default();
+        let mut buffers: [Vec<Batch>; 3] = Default::default();
+        let mut staging: [Vec<Stroke>; 3] = Default::default();
         let mut offsets = Vec::with_capacity(data.total_layers() + 1);
-        let mut counts = [0u32; 2];
+        let mut counts = [0u32; 3];
         let framing = FramingIndex::new(&data.layers);
         let (role, object_bounds) = framing.object().unwrap_or((Role::Object, data.bounds));
         let span = object_bounds.size().into_iter().fold(0., f64::max) as f32;
@@ -81,7 +87,11 @@ impl Scene {
             out.push(Batch::new(
                 device,
                 v,
-                if pass == 0 { span } else { 0. },
+                if pass == Pass::Travel as usize {
+                    0.
+                } else {
+                    span
+                },
                 |s| Role::of(crate::types::ExtrusionType::ALL[s.paint[0] as usize]) == role,
             ));
             v.clear();
@@ -90,11 +100,12 @@ impl Scene {
         for (_, layer) in data.layers.layer_ranges() {
             offsets.push(counts);
             for s in segments.by_ref().take(layer.len()) {
-                let pass = usize::from(s.is_travel);
-                counts[pass] += 1;
-                staging[pass].push(Stroke::model(&s, origin, ranges));
-                if staging[pass].len() == BATCH {
-                    upload(&mut staging[pass], &mut buffers[pass], pass);
+                let pass = Pass::of(s.extrusion_type, s.is_travel, support_opacity < 1.);
+                let i = pass as usize;
+                counts[i] += 1;
+                staging[i].push(Stroke::model(&s, origin, ranges, pass));
+                if staging[i].len() == BATCH {
+                    upload(&mut staging[i], &mut buffers[i], i);
                 }
             }
         }
@@ -108,6 +119,11 @@ impl Scene {
             origin,
             buffers,
             object_bounds,
+            support_opacity: if counts[Pass::Support as usize] == 0 {
+                1.
+            } else {
+                support_opacity
+            },
             framing,
             offsets,
         }
@@ -116,8 +132,9 @@ impl Scene {
     pub fn draws(
         &self,
         layers: Range<usize>,
-        pass: usize,
+        pass: Pass,
     ) -> impl Iterator<Item = (&Batch, Range<u32>)> {
+        let pass = pass as usize;
         let start = self.offsets[layers.start][pass] as usize;
         let end = self.offsets[layers.end][pass] as usize;
         let first = start / BATCH;

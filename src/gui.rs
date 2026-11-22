@@ -68,7 +68,7 @@ impl Gcv {
                 .unwrap_or_else(|| data.total_layers().saturating_sub(1)),
         );
         Self {
-            model: Box::new(Model::new(&gpu.device, data)),
+            model: Box::new(Model::new(&gpu.device, data, options.support_opacity)),
             viewport: Viewport::new(gpu),
             input_path: filename.to_string_lossy().into_owned(),
             filename,
@@ -108,9 +108,10 @@ impl Gcv {
         let device = self.viewport.state.device.clone();
         let sender = self.events_tx.clone();
         let repaint = ctx.clone();
+        let opacity = self.options.support_opacity;
         std::thread::spawn(move || {
             let result = crate::load_with(&path, None, crate::parser::parse_compact)
-                .map(|data| Box::new(Model::new(&device, data)))
+                .map(|data| Box::new(Model::new(&device, data, opacity)))
                 .map_err(|e| e.to_string());
             let _ = sender.send(Event::Loaded(path, result));
             repaint.request_repaint();
