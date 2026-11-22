@@ -1,6 +1,6 @@
 [package]
 name = "gcv"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.99.1"
 description = "3D G-code toolpath viewer with interactive GUI and CLI PNG export"
