@@ -95,8 +95,8 @@ mod tests {
 
     #[test]
     fn full_frame_clipping_preserves_depth_and_translucent_line_order() {
-        let mut reference = Raster::new(117, 93).unwrap();
-        let mut parallel = Raster::new(117, 93).unwrap();
+        let mut reference = Raster::new(117, 93, [0; 4]).unwrap();
+        let mut parallel = Raster::new(117, 93, [0; 4]).unwrap();
         for (width, opacity, write_depth) in [(1.5, 1., true), (0.6, 0.35, false)] {
             let mut lines = Vec::new();
             for i in 0..150 {

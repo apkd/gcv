@@ -50,7 +50,7 @@ gcv model.gcode
 gcv model.gcode --export output.png
 
 # File preview with the slicer's print time, filament and settings
-gcv model.gcode --print-info -r 1280x900 -e preview.png
+gcv model.gcode --print-info --no-bed --transparent -r 1280x900 -e preview.png
 
 # Custom options
 gcv model.gcode -e output.png \
@@ -79,6 +79,7 @@ gcv model.gcode -e output.png \
 | `--show-travel` | off | Show travel moves |
 | `--support-opacity` | 1 | Opacity per support line, from 0 (hidden) to 1 (opaque) |
 | `--no-bed` | off | Hide print bed |
+| `--transparent` | off | Use a transparent PNG background |
 | `--color-mode` | `feature` | `feature`, `height`, `speed`, `fan`, `temperature`, `flow` |
 | `--min-layer` | 0 | Minimum layer to display |
 | `--scale`, `-s` | 1 | Scale viewport and PNG resolution (e.g. `0.5` for half width and height) |

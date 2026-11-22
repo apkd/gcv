@@ -53,6 +53,9 @@ pub struct Args {
     /// Hide the print bed and its grid
     #[arg(long)]
     pub no_bed: bool,
+    /// Export PNGs with a transparent background
+    #[arg(long)]
+    pub transparent: bool,
     /// feature, height, speed, fan, temperature, flow
     #[arg(long, default_value = "feature")]
     pub color_mode: ColorMode,
@@ -173,6 +176,7 @@ impl Args {
             show_travel: self.show_travel,
             support_opacity: self.support_opacity,
             show_bed: !self.no_bed,
+            transparent: self.transparent,
             color_mode: self.color_mode,
             camera,
             show_legend: !self.no_legend,

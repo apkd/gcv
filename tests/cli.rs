@@ -69,6 +69,56 @@ fn export_real_png_without_display_and_scaled_dimensions() {
 }
 
 #[test]
+fn transparent_png_composites_back_to_the_opaque_export() {
+    let temp = TempDir::new();
+    let input = temp.join("support.gcode");
+    std::fs::write(&input, "M83\n;TYPE:Perimeter\nG0 X40 Y40 Z1\nG1 X90 Y80 E1\n;TYPE:Support\nG0 X40 Y70 Z2\nG1 X90 Y45 E1\n").unwrap();
+    let output = temp.join("preview.png");
+    // Exercise the whole-print feature path and the detailed renderer with a bed and legend.
+    for options in [
+        &["--no-bed", "--no-legend"][..],
+        &["--color-mode", "height"][..],
+    ] {
+        let mut args = vec![
+            input.to_str().unwrap(),
+            "-e",
+            output.to_str().unwrap(),
+            "-r",
+            "360x240",
+            "--support-opacity",
+            "0.5",
+        ];
+        args.extend_from_slice(options);
+        let read = |args: &[&str]| {
+            let result = run(args);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            image::open(&output).unwrap().to_rgba8()
+        };
+        let opaque = read(&args);
+        args.push("--transparent");
+        let transparent = read(&args);
+        assert!(transparent.pixels().any(|p| p[3] == 0));
+        assert!(transparent.pixels().any(|p| (1..255).contains(&p[3])));
+        assert!(transparent.pixels().any(|p| p[3] == 255));
+        for (p, expected) in transparent.pixels().zip(opaque.pixels()) {
+            let a = u32::from(p[3]);
+            for (i, bg) in gcv::colors::BACKGROUND.into_iter().enumerate() {
+                let composite =
+                    ((u32::from(p[i]) * a + u32::from(bg) * (255 - a) + 127) / 255) as u8;
+                assert!(
+                    composite.abs_diff(expected[i]) <= 2,
+                    "{p:?} over background vs {expected:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn print_info_respects_binary_block_roles_in_both_export_paths() {
     let temp = TempDir::new();
     let body = "G90\nG1 Z0.2\nG1 X5 Y5 E1\nG1 X20 E2\n";

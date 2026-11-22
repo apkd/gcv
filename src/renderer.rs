@@ -22,6 +22,7 @@ use crate::{
 /// Limits both the RGBA image and the equally sized f32 depth buffer (~256 MiB).
 pub const MAX_PIXELS: u64 = 33_554_432;
 pub const MAX_DIMENSION: u32 = 16_384;
+const OPAQUE_BACKGROUND: [u8; 4] = [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 255];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderOptions {
@@ -33,6 +34,8 @@ pub struct RenderOptions {
     pub show_travel: bool,
     pub support_opacity: f64,
     pub show_bed: bool,
+    /// Leave the background transparent in PNG exports.
+    pub transparent: bool,
     pub color_mode: ColorMode,
     pub camera: Camera,
     /// Extrusion stroke width in output pixels.
@@ -50,6 +53,7 @@ impl Default for RenderOptions {
             show_travel: false,
             support_opacity: 1.,
             show_bed: true,
+            transparent: false,
             color_mode: ColorMode::Feature,
             camera: Camera::default(),
             line_width: 1.5,
@@ -125,7 +129,7 @@ impl Pass {
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    /// Row-major RGBA8 in sRGB; alpha is always 255.
+    /// Row-major sRGB pixels with straight (unassociated) alpha.
     pub rgba: Vec<u8>,
 }
 
@@ -343,14 +347,14 @@ struct Band<'a> {
 }
 
 impl Raster {
-    fn new(width: u32, height: u32) -> Result<Self, RenderError> {
+    fn new(width: u32, height: u32, background: [u8; 4]) -> Result<Self, RenderError> {
         validate_dimensions(width, height)?;
         let count = width as usize * height as usize;
         let mut rgba = Vec::new();
         rgba.try_reserve_exact(count * 4)
             .map_err(|error| RenderError(format!("image allocation failed: {error}")))?;
         for _ in 0..count {
-            rgba.extend_from_slice(&[BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 255]);
+            rgba.extend_from_slice(&background);
         }
         let mut depth = Vec::new();
         depth
@@ -377,22 +381,37 @@ impl Raster {
     }
 }
 
-impl Band<'_> {
-    #[inline]
-    fn blend(&mut self, pixel: usize, color: [u8; 3], alpha: f64) {
-        let rgb = &mut self.rgba[pixel * 4..pixel * 4 + 3];
-        if alpha >= 1.0 {
-            rgb.copy_from_slice(&color);
+#[inline]
+fn blend_over(dst: &mut [u8; 4], color: [u8; 3], alpha: f64) {
+    let [r, g, b] = color;
+    if alpha >= 1. {
+        *dst = [r, g, b, 255];
+        return;
+    }
+    let mix = match dst[3] {
+        255 => alpha,
+        0 => {
+            let a = (alpha * 255. + 0.5) as u8;
+            if a != 0 {
+                *dst = [r, g, b, a];
+            }
             return;
         }
-        // Round coverage once, then mix each channel with one multiply.
-        let weight = (alpha * 65_536. + 0.5) as i32;
-        for (dst, src) in rgb.iter_mut().zip(color) {
-            let base = i32::from(*dst);
-            *dst = (base + (((i32::from(src) - base) * weight + 32_768) >> 16)) as u8;
+        a => {
+            // With straight alpha, mix RGB by the source's share of the output alpha.
+            let out = f64::from(a) + f64::from(255 - a) * alpha;
+            dst[3] = (out + 0.5) as u8;
+            alpha * 255. / out
         }
+    };
+    let weight = (mix * 65_536. + 0.5) as i32;
+    for (d, src) in dst.iter_mut().zip(color) {
+        let base = i32::from(*d);
+        *d = (base + (((i32::from(src) - base) * weight + 32_768) >> 16)) as u8;
     }
+}
 
+impl Band<'_> {
     fn line(
         &mut self,
         a: ScreenPoint,
@@ -476,8 +495,8 @@ impl Band<'_> {
                 if write_depth {
                     self.depth[pixel] = metric;
                 }
-                self.blend(
-                    pixel,
+                blend_over(
+                    &mut self.rgba.as_chunks_mut::<4>().0[pixel],
                     *color.get_or_insert_with(&mut resolve),
                     opacity * (outer - distance2.sqrt()).min(1.0),
                 );
@@ -490,7 +509,11 @@ impl Raster {
     fn overlay_pixel(&mut self, x: i32, y: i32, color: [u8; 3], alpha: f64) {
         if (x as u32) < self.frame.width && (y as u32) < self.frame.height {
             let pixel = y as usize * self.frame.width as usize + x as usize;
-            self.band().blend(pixel, color, alpha);
+            blend_over(
+                &mut self.frame.rgba.as_chunks_mut::<4>().0[pixel],
+                color,
+                alpha,
+            );
         }
     }
     fn line(
@@ -519,7 +542,7 @@ impl Raster {
         }
     }
 
-    fn bed_triangle(&mut self, vertices: [ScreenPoint; 3]) {
+    fn bed_triangle(&mut self, vertices: [ScreenPoint; 3], fill: [u8; 4]) {
         if !vertices
             .iter()
             .all(|point| point.x.is_finite() && point.y.is_finite())
@@ -565,11 +588,8 @@ impl Raster {
                 let b = edge(vertices[2], vertices[0], px, py) / area;
                 let c = 1.0 - a - b;
                 if a >= -1e-9 && b >= -1e-9 && c >= -1e-9 {
-                    // Composite the translucent bed against the known background
-                    // once; the two triangles then share a seamless diagonal.
-                    let color = BACKGROUND
-                        .map(|value| (f64::from(value) * 0.7 + 216.0 * 0.3).round() as u8);
-                    self.overlay_pixel(x, y, color, 1.0);
+                    let i = y as usize * self.frame.width as usize + x as usize;
+                    self.frame.rgba.as_chunks_mut::<4>().0[i] = fill;
                 }
             }
         }
@@ -679,12 +699,15 @@ fn clip_crossing(
     }))
 }
 
-fn draw_bed(raster: &mut Raster, projection: &Projection, [x, y]: [f64; 2]) {
+fn draw_bed(raster: &mut Raster, projection: &Projection, [x, y]: [f64; 2], background: [u8; 4]) {
     let points = [[0.0, 0.0, 0.0], [x, 0.0, 0.0], [x, y, 0.0], [0.0, y, 0.0]];
     let projected = points.map(|point| projection.project(point));
     if let [Some(a), Some(b), Some(c), Some(d)] = projected {
-        raster.bed_triangle([a, b, c]);
-        raster.bed_triangle([a, c, d]);
+        // Fill both triangles with the same composite so the shared diagonal blends once.
+        let mut fill = background;
+        blend_over(&mut fill, [216; 3], 0.3);
+        raster.bed_triangle([a, b, c], fill);
+        raster.bed_triangle([a, c, d], fill);
     }
     let labels = bed_lines([x, y], |ends, color, width, opacity| {
         raster.world_line(projection, ends, color, width, opacity, true);
@@ -870,9 +893,14 @@ fn canvas(
     let projection = Projection::framed(subject.bounds(), bed, options, legend, |p, s| {
         subject.project(p, s)
     })?;
-    let mut raster = Raster::new(options.width, options.height)?;
+    let background = if options.transparent {
+        [0; 4]
+    } else {
+        OPAQUE_BACKGROUND
+    };
+    let mut raster = Raster::new(options.width, options.height, background)?;
     if options.show_bed {
-        draw_bed(&mut raster, &projection, bed);
+        draw_bed(&mut raster, &projection, bed, background);
     }
     Ok((raster, projection))
 }
@@ -1135,6 +1163,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overlapping_translucent_strokes_composite_on_any_background() {
+        let mut layer = [0; 4];
+        blend_over(&mut layer, [255, 0, 0], 0.5);
+        assert_eq!(layer, [255, 0, 0, 128]);
+        blend_over(&mut layer, [0, 0, 255], 0.5);
+        // The top stroke contributes half the light, the lower stroke a quarter.
+        for background in [[255u8; 3], [12, 34, 56]] {
+            let [r, g, b] = background;
+            let mut pixel = [r, g, b, 255];
+            let [red, green, blue, alpha] = layer;
+            blend_over(&mut pixel, [red, green, blue], f64::from(alpha) / 255.);
+            for (i, stroke) in [63.75, 0., 127.5].into_iter().enumerate() {
+                let expected = (stroke + f64::from(background[i]) * 0.25).round() as u8;
+                assert!(pixel[i].abs_diff(expected) <= 1);
+            }
+        }
+    }
+
+    #[test]
     fn scanlines_cover_the_caps_and_sides_of_a_stroke() {
         let a = ScreenPoint {
             x: 3.25,
@@ -1150,7 +1197,7 @@ mod tests {
             (30., 31.),
         ] {
             let b = ScreenPoint { x, y, ..a };
-            let mut raster = Raster::new(34, 40).unwrap();
+            let mut raster = Raster::new(34, 40, OPAQUE_BACKGROUND).unwrap();
             raster.line(a, b, [255; 3], 2.3, 1., true);
             let dx = b.x - a.x;
             let dy = b.y - a.y;
@@ -1217,7 +1264,7 @@ mod tests {
     #[test]
     fn depth_buffer_prefers_nearer_line_independent_of_submission_order() {
         for reverse in [false, true] {
-            let mut raster = Raster::new(64, 64).unwrap();
+            let mut raster = Raster::new(64, 64, OPAQUE_BACKGROUND).unwrap();
             let mut lines = [(0.2, [255, 0, 0]), (0.5, [0, 255, 0])];
             if reverse {
                 lines.reverse();
@@ -1247,7 +1294,7 @@ mod tests {
 
     #[test]
     fn raster_line_clips_a_million_pixel_segment() {
-        let mut raster = Raster::new(32, 32).unwrap();
+        let mut raster = Raster::new(32, 32, OPAQUE_BACKGROUND).unwrap();
         raster.line(
             ScreenPoint {
                 x: -1_000_000.0,
