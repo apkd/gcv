@@ -175,7 +175,17 @@ fn stats_are_json_and_binary_magic_beats_extension() {
     );
     let stats: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(stats["schema_version"], 1);
-    assert!(stats["total_segments"].as_u64().unwrap() > 0);
+    let segments = stats["total_segments"].as_u64().unwrap();
+    let layers = stats["layers"].as_array().unwrap();
+    assert!(segments > 0);
+    assert_eq!(layers.len() as u64, stats["total_layers"].as_u64().unwrap());
+    assert_eq!(
+        layers
+            .iter()
+            .map(|l| l["segments"].as_u64().unwrap())
+            .sum::<u64>(),
+        segments
+    );
     assert!(stats["diagnostics"].is_array());
 }
 

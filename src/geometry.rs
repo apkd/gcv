@@ -3,6 +3,8 @@
 use crate::types::{Bounds, Diagnostic, ExtrusionType, LayerTable, Segment};
 mod preview;
 pub(crate) use preview::{PreviewLine, PreviewPaths};
+mod detailed;
+pub(crate) use detailed::{DetailedLayers, DetailedPrint};
 
 // Both consumers use the same modal interpreter and logical segment limits.
 // The PNG exporter can retain planar arcs until the projection is known.

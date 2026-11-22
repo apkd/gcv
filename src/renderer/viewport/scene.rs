@@ -6,7 +6,8 @@ use super::super::{
 use super::detail::Batch;
 use crate::{
     colors::{ColorRanges, segment_value},
-    types::{Bounds, ColorMode, Segment, ToolpathData},
+    geometry::DetailedPrint,
+    types::{Bounds, ColorMode, Segment},
 };
 use bytemuck::{Pod, Zeroable};
 use eframe::wgpu;
@@ -65,21 +66,13 @@ pub(crate) struct Scene {
 }
 
 impl Scene {
-    pub fn upload(device: &wgpu::Device, data: &ToolpathData, ranges: &ColorRanges) -> Self {
+    pub fn upload(device: &wgpu::Device, data: &DetailedPrint, ranges: &ColorRanges) -> Self {
         let origin = data.bounds.center();
         let mut buffers = [Vec::new(), Vec::new()];
         let mut staging: [Vec<Stroke>; 2] = Default::default();
-        let mut offsets = Vec::with_capacity(data.layers.len() + 1);
+        let mut offsets = Vec::with_capacity(data.total_layers() + 1);
         let mut counts = [0u32; 2];
-        for layer in data.layers.iter() {
-            offsets.push(counts);
-            for s in layer.segments {
-                let pass = usize::from(s.is_travel);
-                counts[pass] += 1;
-            }
-        }
-        offsets.push(counts);
-        let framing = FramingIndex::new(data.layers.segments());
+        let framing = FramingIndex::new(&data.layers);
         let (role, object_bounds) = framing.object().unwrap_or((Role::Object, data.bounds));
         let span = object_bounds.size().into_iter().fold(0., f64::max) as f32;
         let upload = |v: &mut Vec<Stroke>, out: &mut Vec<Batch>, pass: usize| {
@@ -93,13 +86,19 @@ impl Scene {
             ));
             v.clear();
         };
-        for s in data.segments() {
-            let pass = usize::from(s.is_travel);
-            staging[pass].push(Stroke::model(s, origin, ranges));
-            if staging[pass].len() == BATCH {
-                upload(&mut staging[pass], &mut buffers[pass], pass);
+        let mut segments = data.segments();
+        for (_, layer) in data.layers.layer_ranges() {
+            offsets.push(counts);
+            for s in segments.by_ref().take(layer.len()) {
+                let pass = usize::from(s.is_travel);
+                counts[pass] += 1;
+                staging[pass].push(Stroke::model(&s, origin, ranges));
+                if staging[pass].len() == BATCH {
+                    upload(&mut staging[pass], &mut buffers[pass], pass);
+                }
             }
         }
+        offsets.push(counts);
         for (pass, (v, out)) in staging.iter_mut().zip(&mut buffers).enumerate() {
             if !v.is_empty() {
                 upload(v, out, pass);
@@ -134,13 +133,13 @@ impl Scene {
 
     pub fn selection<'a>(
         &'a self,
-        data: &'a ToolpathData,
+        data: &'a DetailedPrint,
         layers: Range<usize>,
         travel: bool,
     ) -> Option<Selection<'a>> {
         let offset = |i: usize| self.offsets[i].iter().sum::<u32>() as usize;
         self.framing.select(
-            data.layers.segments(),
+            &data.layers,
             offset(layers.start)..offset(layers.end),
             travel,
         )

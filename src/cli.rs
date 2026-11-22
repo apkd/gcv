@@ -6,7 +6,9 @@ use crate::{
     types::ColorMode,
 };
 use clap::Parser;
-use std::{collections::BTreeMap, error::Error, path::PathBuf};
+use std::{error::Error, path::PathBuf};
+
+mod stats;
 
 #[derive(Clone, Debug, Parser)]
 #[command(
@@ -218,37 +220,10 @@ pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
             destination,
         );
     }
-    let toolpath = crate::load_with(&args.file, info.as_mut(), crate::parser::parse_detailed)?;
+    let toolpath = crate::load_with(&args.file, info.as_mut(), crate::parser::parse_compact)?;
     check_selection(&args, toolpath.total_layers(), &toolpath.diagnostics)?;
     if args.stats {
-        let mut features = BTreeMap::<&str, usize>::new();
-        let mut extrusion_segments = 0;
-        let mut travel_segments = 0;
-        let mut extrusion_distance = 0.0;
-        let mut travel_distance = 0.0;
-        for segment in toolpath.segments() {
-            *features.entry(segment.extrusion_type.label()).or_default() += 1;
-            if segment.is_travel {
-                travel_segments += 1;
-                travel_distance += segment.length();
-            } else {
-                extrusion_segments += 1;
-                extrusion_distance += segment.length();
-            }
-        }
-        let stats = serde_json::json!({
-            "schema_version": 1,
-            "file": args.file.to_string_lossy(),
-            "total_layers": toolpath.total_layers(), "total_segments": toolpath.total_segments(),
-            "extrusion_segments": extrusion_segments, "travel_segments": travel_segments,
-            "extrusion_distance_mm": extrusion_distance, "travel_distance_mm": travel_distance,
-            "bed": {"x": toolpath.bed_x, "y": toolpath.bed_y, "max_z": toolpath.max_z},
-            "bounds": {"min": toolpath.bounds.min, "max": toolpath.bounds.max},
-            "features": features,
-            "layers": toolpath.layers.iter().map(|l| serde_json::json!({"index":l.layer_index,"z_height":l.z_height,"segments":l.segments.len()})).collect::<Vec<_>>(),
-            "diagnostics": toolpath.diagnostics.iter().map(|d| serde_json::json!({"line":d.line,"message":d.message})).collect::<Vec<_>>()
-        });
-        println!("{}", serde_json::to_string_pretty(&stats)?);
+        stats::write(&toolpath, &args.file, std::io::stdout().lock())?;
         return Ok(());
     }
     report(
@@ -259,7 +234,7 @@ pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
     );
     #[cfg(feature = "gui")]
     {
-        crate::gui::run_app(toolpath, args.file, options, args.scale as f32)
+        crate::gui::run_print(toolpath, args.file, options, args.scale as f32)
             .map_err(|e| format!("desktop viewer: {e}"))?;
         Ok(())
     }

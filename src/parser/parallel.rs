@@ -338,8 +338,34 @@ mod tests {
         );
         assert_eq!(serial.bounds, joined.bounds);
         assert_eq!(serial.diagnostics, joined.diagnostics);
+        let compact = parse_compact(&text, None).unwrap();
+        assert_eq!(compact.total_segments(), serial.count);
+        assert!(
+            compact
+                .segments()
+                .zip(serial.geometry.segments())
+                .all(|(a, b)| a == *b && a.temperature.to_bits() == b.temperature.to_bits())
+        );
+        assert!(
+            compact
+                .layers
+                .layer_ranges()
+                .map(|(z, r)| (z, r.len()))
+                .eq(serial
+                    .geometry
+                    .iter()
+                    .map(|l| (l.z_height, l.segments.len())))
+        );
         // Some cuts fall in the middle of a layer. Selecting it must return
         // every chord, including travel moves and their original color values.
+        #[cfg(feature = "gui")]
+        for layer in serial.geometry.iter() {
+            let segments = compact
+                .layers
+                .chunks(layer.layer_index..layer.layer_index + 1)
+                .flat_map(|c| c.segments());
+            assert!(segments.eq(layer.segments.iter().cloned()));
+        }
         for mode in [
             crate::types::ColorMode::Speed,
             crate::types::ColorMode::Flow,

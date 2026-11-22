@@ -860,6 +860,36 @@ pub fn render(toolpath: &ToolpathData, options: &RenderOptions) -> Result<Frame,
     )
 }
 
+#[cfg(feature = "gui")]
+pub(crate) fn render_detailed(
+    print: &crate::geometry::DetailedPrint,
+    options: &RenderOptions,
+) -> Result<Frame, RenderError> {
+    let chunks: Vec<_> = print
+        .layers
+        .chunks(options.layers(print.total_layers()))
+        .collect();
+    render_lines(
+        [print.bed_x, print.bed_y],
+        print.bounds,
+        options,
+        None,
+        print.segments().map(|s| {
+            (
+                s.extrusion_type,
+                s.is_travel,
+                colors::segment_value(&s, options.color_mode),
+            )
+        }),
+        &chunks,
+        |&chunk| {
+            chunk
+                .segments()
+                .map(|s| PreviewLine::from_segment(&s, options.color_mode))
+        },
+    )
+}
+
 pub(crate) fn render_preview(
     print: &Print<PreviewPaths>,
     options: &RenderOptions,

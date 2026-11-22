@@ -354,7 +354,21 @@ pub(crate) fn parse_detailed(
     text: &str,
     info: Option<&mut crate::print_info::Collector>,
 ) -> Result<ToolpathData, ParseError> {
-    let p = interpret(text, info, LayerTable::default)?;
+    parse_layers::<LayerTable>(text, info)
+}
+
+pub(crate) fn parse_compact(
+    text: &str,
+    info: Option<&mut crate::print_info::Collector>,
+) -> Result<crate::geometry::DetailedPrint, ParseError> {
+    parse_layers::<crate::geometry::DetailedLayers>(text, info)
+}
+
+fn parse_layers<G: Geometry + Default>(
+    text: &str,
+    info: Option<&mut crate::print_info::Collector>,
+) -> Result<ToolpathData<G>, ParseError> {
+    let p = interpret(text, info, G::default)?;
     Ok(ToolpathData {
         layers: p.geometry,
         bounds: p.bounds,

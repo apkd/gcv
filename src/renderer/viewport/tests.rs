@@ -3,7 +3,7 @@ use crate::{
     camera::{Camera, CameraPreset},
     gui::tests::gpu,
     parser::parse_gcode,
-    renderer::render,
+    renderer::render_detailed as render,
 };
 
 fn pixels(v: &Viewport) -> Vec<u8> {
@@ -55,13 +55,11 @@ impl Viewport {
 #[test]
 fn viewport_agrees_with_png_across_display_controls() {
     let Some(state) = gpu() else { return };
-    let model = Model::new(
-        &state.device,
-        parse_gcode(include_str!(
-            "../../../tests/fixtures/bgcode/reference.gcode"
-        ))
-        .unwrap(),
-    );
+    let reference = parse_gcode(include_str!(
+        "../../../tests/fixtures/bgcode/reference.gcode"
+    ))
+    .unwrap();
+    let model = Model::new(&state.device, reference.clone());
     let mut view = Viewport::new(state);
     let mut o = RenderOptions {
         width: 311,
@@ -82,7 +80,7 @@ fn viewport_agrees_with_png_across_display_controls() {
         o.show_travel = i % 3 != 0;
         assert_eq!(
             model.legends.get(mode, o.show_travel),
-            colors::legend_entries(&model.data, mode, o.show_travel)
+            colors::legend_entries(&reference, mode, o.show_travel)
         );
         o.show_bed = i == 3;
         if i == 5 {
@@ -91,6 +89,10 @@ fn viewport_agrees_with_png_across_display_controls() {
         view.image(&model, &o, true, false).unwrap();
         let device = pixels(&view);
         let cpu = render(&model.data, &o).unwrap();
+        assert_eq!(
+            cpu.rgba,
+            crate::renderer::render(&reference, &o).unwrap().rgba
+        );
         let mut error = 0u64;
         let mut signal = 0u64;
         for (a, b) in device
@@ -288,7 +290,7 @@ fn orbit_timing() {
     let state = gpu().expect("no graphics adapter");
     let path = std::env::var("GCV_BENCH_FILE").expect("set GCV_BENCH_FILE");
     let parse_started = Instant::now();
-    let data = crate::load_toolpath(&path).unwrap();
+    let data = crate::load_with(&path, None, crate::parser::parse_compact).unwrap();
     let parse = parse_started.elapsed();
     let now = Instant::now();
     let model = Model::new(&state.device, data);

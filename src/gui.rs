@@ -1,7 +1,7 @@
 //! Native desktop frontend. Parse and upload replacement models off the UI thread.
 use crate::{
     camera::{Camera, CameraPreset},
-    load_toolpath,
+    geometry::DetailedPrint,
     renderer::{
         self, RenderOptions,
         viewport::{Model, Viewport},
@@ -44,6 +44,16 @@ impl Gcv {
     pub fn new(
         gpu: eframe::egui_wgpu::RenderState,
         data: ToolpathData,
+        filename: PathBuf,
+        options: RenderOptions,
+        render_scale: f32,
+    ) -> Self {
+        Self::from_print(gpu, data.into(), filename, options, render_scale)
+    }
+
+    fn from_print(
+        gpu: eframe::egui_wgpu::RenderState,
+        data: DetailedPrint,
         filename: PathBuf,
         mut options: RenderOptions,
         render_scale: f32,
@@ -99,7 +109,7 @@ impl Gcv {
         let sender = self.events_tx.clone();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let result = load_toolpath(&path)
+            let result = crate::load_with(&path, None, crate::parser::parse_compact)
                 .map(|data| Box::new(Model::new(&device, data)))
                 .map_err(|e| e.to_string());
             let _ = sender.send(Event::Loaded(path, result));
@@ -131,7 +141,8 @@ impl Gcv {
         let repaint = ctx.clone();
         std::thread::spawn(move || {
             let result = (|| -> Result<PathBuf, String> {
-                let frame = renderer::render(&data, &options).map_err(|e| e.to_string())?;
+                let frame =
+                    renderer::render_detailed(&data, &options).map_err(|e| e.to_string())?;
                 let base = if name.is_empty() { "gcode" } else { &name };
                 for suffix in 0..10_000 {
                     let path = PathBuf::from(if suffix == 0 {
@@ -288,8 +299,8 @@ impl Gcv {
         {
             self.request_motion_frame();
         }
-        if let Some(layer) = self.model.data.layers.get(max) {
-            ui.label(format!("Z = {:.3} mm", layer.z_height));
+        if let Some(z) = self.model.data.layers.height(max) {
+            ui.label(format!("Z = {z:.3} mm"));
         }
         ui.small("Zero-based Z groups include startup, hops and parking.");
         ui.separator();
@@ -499,6 +510,15 @@ pub fn run_app(
     options: RenderOptions,
     render_scale: f32,
 ) -> eframe::Result {
+    run_print(data.into(), filename, options, render_scale)
+}
+
+pub(crate) fn run_print(
+    data: DetailedPrint,
+    filename: PathBuf,
+    options: RenderOptions,
+    render_scale: f32,
+) -> eframe::Result {
     let title = format!(
         "gcv — {}",
         filename.file_name().unwrap_or_default().to_string_lossy()
@@ -515,7 +535,7 @@ pub fn run_app(
         native,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(Gcv::new(
+            Ok(Box::new(Gcv::from_print(
                 cc.wgpu_render_state.clone().expect("wgpu renderer"),
                 data,
                 filename,

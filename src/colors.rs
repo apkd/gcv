@@ -37,11 +37,16 @@ pub struct ColorRanges {
 
 impl ColorRanges {
     pub fn from_toolpath(toolpath: &ToolpathData) -> Self {
-        Self::collect(toolpath, |_| {})
+        Self::collect(toolpath.bounds, toolpath.segments(), |_| {})
     }
-    fn collect(toolpath: &ToolpathData, mut observe: impl FnMut(&Segment)) -> Self {
+    fn collect<S: std::borrow::Borrow<Segment>>(
+        bounds: crate::types::Bounds,
+        segments: impl Iterator<Item = S>,
+        mut observe: impl FnMut(&Segment),
+    ) -> Self {
         let mut ranges = [(f64::INFINITY, f64::NEG_INFINITY); 4];
-        for segment in toolpath.segments() {
+        for segment in segments {
+            let segment = segment.borrow();
             observe(segment);
             if segment.is_travel {
                 continue;
@@ -70,7 +75,7 @@ impl ColorRanges {
             }
         }
         Self {
-            height: (toolpath.bounds.min[2], toolpath.bounds.max[2]),
+            height: (bounds.min[2], bounds.max[2]),
             speed: ranges[0],
             fan: ranges[1],
             temperature: ranges[2],
@@ -312,11 +317,11 @@ pub(crate) struct Legends {
 
 #[cfg(feature = "gui")]
 impl Legends {
-    pub fn collect(data: &ToolpathData) -> (ColorRanges, Self) {
+    pub fn collect(data: &crate::geometry::DetailedPrint) -> (ColorRanges, Self) {
         let mut counts = [0; 14];
         let mut visible = [0; 14];
         let mut distinct: [Vec<f64>; 6] = Default::default();
-        let ranges = ColorRanges::collect(data, |s| {
+        let ranges = ColorRanges::collect(data.bounds, data.segments(), |s| {
             counts[s.extrusion_type as usize] += 1;
             if !s.is_travel {
                 visible[s.extrusion_type as usize] += 1;
@@ -358,7 +363,7 @@ impl Legends {
 #[test]
 fn hiding_travel_keeps_extrusions_with_a_travel_feature_tag() {
     let data = crate::parser::parse_gcode(";TYPE:Travel\nG1 X10 E1\nG0 X11").unwrap();
-    let (_, legends) = Legends::collect(&data);
+    let (_, legends) = Legends::collect(&data.clone().into());
     for show in [true, false] {
         assert_eq!(
             legends.get(ColorMode::Feature, show),

@@ -6,7 +6,8 @@ mod tests;
 use super::{Projection, RenderOptions, bed_lines, glyph};
 use crate::{
     colors::{self, BACKGROUND},
-    types::{ColorMode, ExtrusionType, ToolpathData},
+    geometry::DetailedPrint,
+    types::{ColorMode, ExtrusionType},
 };
 use eframe::{
     egui,
@@ -29,7 +30,7 @@ struct Target {
 }
 
 pub(crate) struct Model {
-    pub data: Arc<ToolpathData>,
+    pub data: Arc<DetailedPrint>,
     pub legends: colors::Legends,
     scene: Scene,
     bed: wgpu::Buffer,
@@ -37,7 +38,8 @@ pub(crate) struct Model {
 }
 
 impl Model {
-    pub fn new(device: &wgpu::Device, data: ToolpathData) -> Self {
+    pub fn new(device: &wgpu::Device, data: impl Into<DetailedPrint>) -> Self {
+        let data = data.into();
         let (ranges, legends) = colors::Legends::collect(&data);
         let scene = Scene::upload(device, &data, &ranges);
         let mut strokes = Vec::new();

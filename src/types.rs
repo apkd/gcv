@@ -239,7 +239,7 @@ impl Bounds {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Diagnostic {
     /// One-based input line number; 0 denotes a whole-file diagnostic.
     pub line: usize,
@@ -247,8 +247,8 @@ pub struct Diagnostic {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ToolpathData {
-    pub layers: LayerTable,
+pub struct ToolpathData<L = LayerTable> {
+    pub layers: L,
     pub bed_x: f64,
     pub bed_y: f64,
     pub max_z: f64,

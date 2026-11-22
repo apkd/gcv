@@ -1,7 +1,7 @@
 //! Frame any layer range in groups of 64 visible strokes, as in the PNG export.
 //! Precomputed world bounds reject interior groups before we visit their strokes.
 use super::{BLOCK, Bounds, Projection, Role, ScreenBounds};
-use crate::types::Segment;
+use crate::geometry::DetailedLayers;
 use std::ops::Range;
 
 const GROUP: usize = BLOCK * BLOCK;
@@ -12,12 +12,12 @@ fn union(mut a: Bounds, b: Bounds) -> Bounds {
     a
 }
 
-fn extent(s: &Segment) -> Bounds {
+fn extent([start, end]: [[f64; 3]; 2]) -> Bounds {
     let mut b = Bounds {
-        min: s.start,
-        max: s.start,
+        min: start,
+        max: start,
     };
-    b.include(s.end);
+    b.include(end);
     b
 }
 
@@ -53,10 +53,10 @@ pub(crate) struct FramingIndex {
 }
 
 impl FramingIndex {
-    pub fn new(segments: &[Segment]) -> Self {
+    pub fn new(segments: &DetailedLayers) -> Self {
         let mut index = Self::default();
-        for (i, s) in segments.iter().enumerate() {
-            let b = extent(s);
+        for (i, s) in segments.segments().enumerate() {
+            let b = extent([s.start, s.end]);
             index.all.push(i, b);
             if !s.is_travel {
                 let (ids, boxes) = &mut index.deposited[Role::of(s.extrusion_type) as usize];
@@ -87,7 +87,7 @@ impl FramingIndex {
 
     pub fn select<'a>(
         &'a self,
-        segments: &'a [Segment],
+        segments: &'a DetailedLayers,
         raw: Range<usize>,
         travel: bool,
     ) -> Option<Selection<'a>> {
@@ -119,7 +119,7 @@ impl FramingIndex {
 }
 
 pub(crate) struct Selection<'a> {
-    segments: &'a [Segment],
+    segments: &'a DetailedLayers,
     ids: Option<&'a [u32]>,
     range: Range<usize>,
     boxes: &'a Boxes,
@@ -127,8 +127,9 @@ pub(crate) struct Selection<'a> {
 
 impl Selection<'_> {
     fn exact(&self, range: Range<usize>) -> Bounds {
-        range
-            .map(|i| extent(&self.segments[self.ids.map_or(i, |ids| ids[i] as usize)]))
+        self.segments
+            .endpoints(range.map(|i| self.ids.map_or(i, |ids| ids[i] as usize)))
+            .map(extent)
             .reduce(union)
             .unwrap()
     }
@@ -195,6 +196,7 @@ impl Selection<'_> {
 mod tests {
     use super::*;
     use crate::renderer::RenderOptions;
+    use crate::{geometry::Geometry, types::Segment};
     use crate::{parser::parse_gcode, renderer::framing::Subject, types::ExtrusionType};
 
     #[test]
@@ -217,7 +219,11 @@ mod tests {
                 }
             })
             .collect();
-        let index = FramingIndex::new(&segments);
+        let mut layers = DetailedLayers::default();
+        for s in &segments {
+            layers.segment(s.clone());
+        }
+        let index = FramingIndex::new(&layers);
         for raw in [0..0, 0..1, 200..516, 517..600, 713..17113, 3671..18000] {
             for travel in [true, false] {
                 let cpu = Subject::from_lines(
@@ -229,7 +235,7 @@ mod tests {
                     },
                     travel,
                 );
-                let selected = index.select(&segments, raw.clone(), travel);
+                let selected = index.select(&layers, raw.clone(), travel);
                 assert_eq!(selected.as_ref().map(Selection::bounds), cpu.bounds());
                 let Some(selected) = selected else { continue };
                 for perspective in [true, false] {
